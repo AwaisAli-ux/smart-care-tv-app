@@ -1,0 +1,132 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  Smart Care TV — pubspec.yaml
+#  Premium Streaming App · Flutter
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: smart_care_tv
+description: Smart Care TV — Premium live TV, movies & series streaming app.
+publish_to: 'none'
+
+# App version: shown in Settings screen and app stores
+# Format: major.minor.patch+buildNumber
+version: 1.0.0+1
+
+# ─── SDK Constraints ──────────────────────────────────────────────────────────
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+  flutter: '>=3.10.0'
+
+# ─── Dependencies ─────────────────────────────────────────────────────────────
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # ── Core ───────────────────────────────────────────────────────────────────
+  cupertino_icons: ^1.0.8         # iOS-style icons
+
+  # ── State Management ───────────────────────────────────────────────────────
+  # Manages: favorites list, login state, selected language, settings
+  provider: ^6.1.2
+
+  # ── Navigation ─────────────────────────────────────────────────────────────
+  # Declarative routing — supports deep links, TV remote D-pad, web URLs
+  go_router: ^14.6.2
+
+  # ── Networking ─────────────────────────────────────────────────────────────
+  # Makes HTTP/HTTPS requests to your IPTV API or M3U playlist URL
+  http: ^1.2.2
+
+  # ── Images ─────────────────────────────────────────────────────────────────
+  # Loads + caches network images on device — shows shimmer while loading
+  # Used in: channel cards, movie posters, hero banner, login wall
+  cached_network_image: ^3.3.1
+
+  # ── Video Player ───────────────────────────────────────────────────────────
+  # Core video engine: plays MP4, HLS (.m3u8), DASH, RTMP streams
+  video_player: ^2.9.2
+
+  # Wraps video_player with a full Material/Cupertino UI:
+  # play/pause, seek bar, fullscreen button, subtitles, speed control
+  chewie: ^1.8.5
+
+  # ── Local Storage ──────────────────────────────────────────────────────────
+  # Saves favorites, login token, language setting to device storage
+  # Works on Android, iOS, Web, Desktop — no database setup needed
+  shared_preferences: ^2.3.2
+
+  # ── UI Components ──────────────────────────────────────────────────────────
+  # Skeleton shimmer loading animation (shown before images appear)
+  shimmer: ^3.0.0
+
+  # Renders SVG vector images — for logos and custom icons
+  flutter_svg: ^2.0.10+1
+
+  # Auto-scrolling hero banner carousel on the Home screen
+  carousel_slider: ^5.0.0
+
+  # Animated dot indicators for the hero banner (●●○○)
+  smooth_page_indicator: ^1.2.0+3
+
+  # ── Typography ─────────────────────────────────────────────────────────────
+  # Loads Inter font from Google CDN — no font files to bundle manually
+  # Already wired into app_theme.dart
+  google_fonts: ^6.2.1
+
+  # ── Utilities ──────────────────────────────────────────────────────────────
+  # Formats dates/times for the EPG schedule (e.g. "Today at 8:30 PM")
+  intl: ^0.19.0
+  video_player_win: ^3.2.2
+
+# ─── Dev Dependencies (only used during development, not in final APK) ────────
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  # Official Flutter linting rules — warns about code quality issues
+  flutter_lints: ^4.0.0
+  flutter_launcher_icons: ^0.14.3
+
+# ─── App Icon Configuration ───────────────────────────────────────────────────
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/images/app_logo_square.png"
+  # Adaptive icon: white background matches the logo's own white background
+  adaptive_icon_background: "#FFFFFF"
+  adaptive_icon_foreground: "assets/images/app_logo_square.png"
+  min_sdk_android: 21
+
+# ─── Flutter Section ──────────────────────────────────────────────────────────
+flutter:
+  uses-material-design: true
+
+  # ── Assets ─────────────────────────────────────────────────────────────────
+  # List every asset folder your app uses.
+  # Create these folders inside your project root before running flutter pub get
+  assets:
+    - assets/images/               # App logo, placeholder posters, banners
+    - assets/icons/                # Custom SVG icons (optional)
+
+  # ── Fonts ──────────────────────────────────────────────────────────────────
+  #
+  # OPTION A — Google Fonts (recommended, already active)
+  #   The google_fonts package (listed above) loads Inter automatically.
+  #   No font files or entries here are needed. ✓
+  #
+  # OPTION B — Bundle fonts locally (for offline-first or Play Store builds)
+  #   1. Download Inter from https://fonts.google.com/specimen/Inter
+  #   2. Copy the .ttf files into   assets/fonts/
+  #   3. Uncomment the block below:
+  #
+  # fonts:
+  #   - family: Inter
+  #     fonts:
+  #       - asset: assets/fonts/Inter-Regular.ttf
+  #         weight: 400
+  #       - asset: assets/fonts/Inter-Medium.ttf
+  #         weight: 500
+  #       - asset: assets/fonts/Inter-SemiBold.ttf
+  #         weight: 600
+  #       - asset: assets/fonts/Inter-Bold.ttf
+  #         weight: 700
+
