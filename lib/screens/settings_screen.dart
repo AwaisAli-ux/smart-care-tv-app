@@ -1,8 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';
 import '../theme/app_theme.dart';
+import '../widgets/tv_focus.dart';
+import '../services/app_state.dart';
 
 enum SettingsTab {
-  parentalControl,
   videoQuality,
   notifications,
   device,
@@ -10,41 +13,42 @@ enum SettingsTab {
 }
 
 class SettingsScreen extends StatefulWidget {
-  const SettingsScreen({super.key});
+  final bool sidebarFocused;
+  const SettingsScreen({super.key, this.sidebarFocused = true});
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
   SettingsTab _selectedTab = SettingsTab.videoQuality;
+  final FocusNode _firstSubTabFocusNode = FocusNode(debugLabel: 'FirstSubTab');
 
-  // Parental Control state
-  bool _parentalEnabled = false;
-  bool _blockAdult = true;
-  final List<TextEditingController> _pinControllers = List.generate(4, (_) => TextEditingController());
-  final List<FocusNode> _pinNodes = List.generate(4, (_) => FocusNode());
-
-  @override
-  void dispose() {
-    for (var controller in _pinControllers) {
-      controller.dispose();
-    }
-    for (var node in _pinNodes) {
-      node.dispose();
-    }
-    super.dispose();
-  }
-
-  // Video Quality state
-  String _selectedQuality = 'Auto (Recommended)';
-  final _qualities = ['Auto (Recommended)', '4K Ultra HD', '1080p Full HD', '720p HD', '480p SD'];
-  bool _hwAccel = true;
+  // Platform channel for native app restart
+  static const _nativeCh = MethodChannel('com.example.mbapp/audio');
 
   // Notifications state
   bool _notifContent = true;
   bool _notifLive = true;
   bool _notifSystem = false;
   bool _notifPromos = false;
+
+  @override
+  void didUpdateWidget(SettingsScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.sidebarFocused && !widget.sidebarFocused) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _firstSubTabFocusNode.requestFocus();
+        }
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _firstSubTabFocusNode.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -142,7 +146,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           ],
                         ),
                       ),
-                      _navItem(SettingsTab.parentalControl, Icons.shield_outlined, 'Parental Control'),
                       _navItem(SettingsTab.videoQuality, Icons.video_settings_outlined, 'Video Quality'),
                       _navItem(SettingsTab.notifications, Icons.notifications_outlined, 'Notifications'),
                       _navItem(SettingsTab.device, Icons.smartphone_outlined, 'Device'),
@@ -164,8 +167,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   String _tabLabel(SettingsTab tab) {
     switch (tab) {
-      case SettingsTab.parentalControl:
-        return 'Parental Control';
       case SettingsTab.videoQuality:
         return 'Video Quality';
       case SettingsTab.notifications:
@@ -179,8 +180,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   IconData _tabIcon(SettingsTab tab) {
     switch (tab) {
-      case SettingsTab.parentalControl:
-        return Icons.shield_outlined;
       case SettingsTab.videoQuality:
         return Icons.video_settings_outlined;
       case SettingsTab.notifications:
@@ -196,28 +195,34 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final isActive = _selectedTab == tab;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-      child: InkWell(
-        onTap: () => setState(() => _selectedTab = tab),
-        borderRadius: BorderRadius.circular(8),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-          decoration: BoxDecoration(
-            color: isActive ? AppColors.bg4 : Colors.transparent,
-            borderRadius: BorderRadius.circular(8),
-          ),
-          child: Row(
-            children: [
-              Icon(icon, size: 20, color: isActive ? AppColors.accent : AppColors.textSecondary),
-              const SizedBox(width: 16),
-              Text(
-                label,
-                style: TextStyle(
-                  fontSize: 14,
-                  fontWeight: isActive ? FontWeight.w600 : FontWeight.w400,
-                  color: isActive ? AppColors.accent : AppColors.textSecondary,
+      child: TvFocusable(
+        focusNode: isActive ? _firstSubTabFocusNode : null,
+        autofocus: !widget.sidebarFocused && isActive,
+        onActivate: () => setState(() => _selectedTab = tab),
+        borderRadius: 8,
+        child: InkWell(
+          onTap: () => setState(() => _selectedTab = tab),
+          borderRadius: BorderRadius.circular(8),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            decoration: BoxDecoration(
+              color: isActive ? AppColors.bg4 : Colors.transparent,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Row(
+              children: [
+                Icon(icon, size: 20, color: isActive ? AppColors.accent : AppColors.textSecondary),
+                const SizedBox(width: 16),
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: isActive ? FontWeight.w600 : FontWeight.w400,
+                    color: isActive ? AppColors.accent : AppColors.textSecondary,
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ),
@@ -226,8 +231,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Widget _buildCurrentTab({required bool isPhone}) {
     switch (_selectedTab) {
-      case SettingsTab.parentalControl:
-        return _buildParentalControlTab(isPhone);
       case SettingsTab.videoQuality:
         return _buildVideoQualityTab(isPhone);
       case SettingsTab.notifications:
@@ -267,163 +270,232 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
 
-
-  // ── Parental Control Tab ────────────────────────────────────────────────
-  Widget _buildParentalControlTab(bool isPhone) {
-    final padding = isPhone
-        ? const EdgeInsets.all(16)
-        : const EdgeInsets.all(40);
-    return ListView(
-      padding: padding,
-      children: [
-        _buildHeader('Parental Control', 'Restrict access to content with a PIN'),
-        _buildSwitchRow(
-          title: 'Enable Parental Control',
-          subtitle: 'Require PIN to access restricted content',
-          value: _parentalEnabled,
-          onChanged: (v) => setState(() => _parentalEnabled = v),
-        ),
-        const SizedBox(height: 24),
-        const Text(
-          'Set your 4-digit PIN',
-          style: TextStyle(fontSize: 15, color: AppColors.textPrimary, fontWeight: FontWeight.w500),
-        ),
-        const SizedBox(height: 16),
-        Row(
-          children: List.generate(
-            4,
-            (index) => Container(
-              width: isPhone ? 44 : 50,
-              height: isPhone ? 52 : 60,
-              margin: const EdgeInsets.only(right: 12),
-              decoration: BoxDecoration(
-                color: AppColors.bg3,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: AppColors.border),
-              ),
-              child: Center(
-                child: TextField(
-                  controller: _pinControllers[index],
-                  focusNode: _pinNodes[index],
-                  keyboardType: TextInputType.number,
-                  textAlign: TextAlign.center,
-                  maxLength: 1,
-                  obscureText: true,
-                  style: TextStyle(
-                    fontSize: isPhone ? 20 : 24,
-                    color: AppColors.textPrimary,
-                    fontWeight: FontWeight.w600,
-                  ),
-                  decoration: const InputDecoration(
-                    counterText: '',
-                    border: InputBorder.none,
-                  ),
-                  onChanged: (value) {
-                    if (value.isNotEmpty && index < 3) {
-                      _pinNodes[index + 1].requestFocus();
-                    } else if (value.isEmpty && index > 0) {
-                      _pinNodes[index - 1].requestFocus();
-                    }
-                  },
-                ),
-              ),
-            ),
-          ),
-        ),
-        const SizedBox(height: 32),
-        _buildSwitchRow(
-          title: 'Block Adult Content',
-          value: _blockAdult,
-          onChanged: (v) => setState(() => _blockAdult = v),
-        ),
-        const SizedBox(height: 24),
-        Align(
-          alignment: Alignment.centerLeft,
-          child: ElevatedButton(
-            onPressed: () {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('PIN saved'), backgroundColor: AppColors.bg4),
-              );
-            },
-            child: const Text('Save PIN'),
-          ),
-        ),
-      ],
-    );
-  }
-
-  // ── Video Quality Tab ───────────────────────────────────────────────────
+  // ── Video Quality Tab ─────────────────────────────────────────────────
   Widget _buildVideoQualityTab(bool isPhone) {
     final padding = isPhone
         ? const EdgeInsets.all(16)
         : const EdgeInsets.all(40);
+    final appState = context.watch<AppState>();
+    final bufferOptions = [
+      ('small',  'Small (32 MB)',  'Best for slow connections / low-memory TVs'),
+      ('medium', 'Medium (64 MB)', 'Recommended for most TVs'),
+      ('large',  'Large (128 MB)', 'For fast connections and premium streaming'),
+    ];
+
     return ListView(
       padding: padding,
       children: [
-        _buildHeader('Video Quality', 'Adjust playback quality based on your connection'),
-        ..._qualities.map((q) {
-          final isSelected = _selectedQuality == q;
-          return InkWell(
-            onTap: () => setState(() => _selectedQuality = q),
-            borderRadius: BorderRadius.circular(8),
-            focusColor: AppColors.accent.withValues(alpha: 0.2),
-            child: Container(
-              margin: const EdgeInsets.only(bottom: 12),
-              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
-              decoration: BoxDecoration(
-                color: AppColors.bg2,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(
-                  color: isSelected ? AppColors.accent : AppColors.border,
-                  width: 1,
-                ),
-              ),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Expanded(
-                    child: Text(
-                      q,
-                      style: const TextStyle(
-                        fontSize: 15,
-                        fontWeight: FontWeight.w500,
-                        color: AppColors.textPrimary,
+        _buildHeader('Video Quality', 'Adjust playback quality and decoder settings'),
+
+        // ─── Compatibility Warning Banner ──────────────────────────────────
+        Container(
+          margin: const EdgeInsets.only(bottom: 24),
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1A2540),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: const Color(0xFF3A6FD8), width: 1),
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Icon(Icons.info_outline, color: Color(0xFF5B9CF6), size: 20),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'TV Compatibility Tip',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w700,
+                        color: Color(0xFF5B9CF6),
                       ),
                     ),
+                    const SizedBox(height: 6),
+                    Text(
+                      appState.hardwareAccelEnabled
+                          ? 'Hardware Acceleration is ON. If you see scrambled or black video on your TV, turn this OFF. Software decoding works on all TV brands (MI Box, TCL, Fire Stick, etc.).'
+                          : 'Hardware Acceleration is OFF ✓. Software decoding is active — maximum compatibility with all TV brands (MI Box, TCL, Fire Stick, Samsung, Sony, Hisense).',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: appState.hardwareAccelEnabled
+                            ? Colors.orange.shade300
+                            : Colors.green.shade300,
+                        height: 1.5,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+
+        // ─── Hardware Acceleration ─────────────────────────────────────────
+        _buildSwitchRow(
+          title: 'Hardware Acceleration',
+          subtitle: 'OFF = Software decode (recommended for all TVs)\nON = Hardware decode (may cause scrambled video on some devices)',
+          value: appState.hardwareAccelEnabled,
+          onChanged: (v) => context.read<AppState>().setHardwareAccel(v),
+        ),
+
+        const SizedBox(height: 28),
+        const Text(
+          'STREAM QUALITY',
+          style: TextStyle(
+            fontSize: 11,
+            fontWeight: FontWeight.w700,
+            color: AppColors.textTertiary,
+            letterSpacing: 1.2,
+          ),
+        ),
+        const SizedBox(height: 12),
+        ...['Auto (Recommended)', '4K Ultra HD', '1080p Full HD', '720p HD', '480p SD'].map((q) {
+          final isSelected = appState.selectedQuality == q;
+          return TvFocusable(
+            onActivate: () => context.read<AppState>().setSelectedQuality(q),
+            borderRadius: 8,
+            child: InkWell(
+              onTap: () => context.read<AppState>().setSelectedQuality(q),
+              borderRadius: BorderRadius.circular(8),
+              focusColor: AppColors.accent.withValues(alpha: 0.2),
+              child: Container(
+                margin: const EdgeInsets.only(bottom: 12),
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+                decoration: BoxDecoration(
+                  color: AppColors.bg2,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: isSelected ? AppColors.accent : AppColors.border,
+                    width: 1,
                   ),
-                  Icon(
-                    isSelected ? Icons.check_circle : Icons.circle_outlined,
-                    color: isSelected ? AppColors.accent : AppColors.textTertiary,
-                    size: 22,
-                  ),
-                ],
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Expanded(
+                      child: Text(
+                        q,
+                        style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w500,
+                          color: AppColors.textPrimary,
+                        ),
+                      ),
+                    ),
+                    Icon(
+                      isSelected ? Icons.check_circle : Icons.circle_outlined,
+                      color: isSelected ? AppColors.accent : AppColors.textTertiary,
+                      size: 22,
+                    ),
+                  ],
+                ),
               ),
             ),
           );
         }),
-        const SizedBox(height: 16),
-        _buildSwitchRow(
-          title: 'Hardware Acceleration',
-          value: _hwAccel,
-          onChanged: (v) => setState(() => _hwAccel = v),
+
+        const SizedBox(height: 28),
+        const Text(
+          'BUFFER SIZE',
+          style: TextStyle(
+            fontSize: 11,
+            fontWeight: FontWeight.w700,
+            color: AppColors.textTertiary,
+            letterSpacing: 1.2,
+          ),
         ),
+        const SizedBox(height: 4),
+        const Text(
+          'Controls how much video is pre-loaded. Larger buffers reduce stuttering but use more RAM.',
+          style: TextStyle(fontSize: 12, color: AppColors.textTertiary, height: 1.5),
+        ),
+        const SizedBox(height: 14),
+        ...bufferOptions.map((opt) {
+          final (key, label, desc) = opt;
+          final isSelected = appState.bufferSize == key;
+          return TvFocusable(
+            onActivate: () => context.read<AppState>().setBufferSize(key),
+            borderRadius: 8,
+            child: InkWell(
+              onTap: () => context.read<AppState>().setBufferSize(key),
+              borderRadius: BorderRadius.circular(8),
+              focusColor: AppColors.accent.withValues(alpha: 0.2),
+              child: Container(
+                margin: const EdgeInsets.only(bottom: 10),
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+                decoration: BoxDecoration(
+                  color: AppColors.bg2,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(
+                    color: isSelected ? AppColors.accent : AppColors.border,
+                    width: 1,
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            label + (key == 'medium' ? '  —  Recommended' : ''),
+                            style: const TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w500,
+                              color: AppColors.textPrimary,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            desc,
+                            style: const TextStyle(
+                              fontSize: 12,
+                              color: AppColors.textTertiary,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Icon(
+                      isSelected ? Icons.check_circle : Icons.circle_outlined,
+                      color: isSelected ? AppColors.accent : AppColors.textTertiary,
+                      size: 22,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          );
+        }),
+
         const SizedBox(height: 24),
-        Align(
-          alignment: Alignment.centerLeft,
-          child: ElevatedButton(
-            onPressed: () {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Quality saved'), backgroundColor: AppColors.bg4),
-              );
-            },
-            child: const Text('Save'),
+        // Settings are saved automatically on change — no Save button needed
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          decoration: BoxDecoration(
+            color: Colors.green.withValues(alpha: 0.1),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: Colors.green.withValues(alpha: 0.3)),
+          ),
+          child: const Row(
+            children: [
+              Icon(Icons.check_circle_outline, color: Colors.green, size: 16),
+              SizedBox(width: 8),
+              Text(
+                'Settings are saved automatically',
+                style: TextStyle(fontSize: 13, color: Colors.green),
+              ),
+            ],
           ),
         ),
       ],
     );
   }
 
-  // ── Notifications Tab ───────────────────────────────────────────────────
+  // ── Notifications Tab ──────────────────────────────────────────────────
   Widget _buildNotificationsTab(bool isPhone) {
     final padding = isPhone
         ? const EdgeInsets.all(16)
@@ -464,11 +536,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  // ── Device Tab ──────────────────────────────────────────────────────────
+  // ── Device Tab ────────────────────────────────────────────────────────
   Widget _buildDeviceTab(bool isPhone) {
     final padding = isPhone
         ? const EdgeInsets.all(16)
         : const EdgeInsets.all(40);
+    final appState = context.watch<AppState>();
     return ListView(
       padding: padding,
       children: [
@@ -481,7 +554,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
         _buildActionRow(
           title: 'App Version',
-          subtitle: 'Smart Care TV v2.1.0',
+          subtitle: 'Smart Care TV v2.2.0',
         ),
         _buildActionRow(
           title: 'Clear Cache',
@@ -493,16 +566,70 @@ class _SettingsScreenState extends State<SettingsScreen> {
             );
           },
         ),
-        _buildActionRow(
-          title: 'Refresh Content',
-          subtitle: 'Reload all channels and metadata',
-          actionText: 'Refresh',
-          onTap: () {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('Content refreshed'), backgroundColor: AppColors.bg4),
-            );
-          },
+
+        // ── Refresh Content — wired to actually reload from server ─────────
+        Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 16),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Refresh Content',
+                          style: TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w500,
+                            color: AppColors.textPrimary,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          appState.isRefreshing
+                              ? 'Reloading channels, movies & series…'
+                              : 'Reload all channels and metadata from server',
+                          style: const TextStyle(
+                            fontSize: 13,
+                            color: AppColors.textTertiary,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  appState.isRefreshing
+                      ? const SizedBox(
+                          width: 24,
+                          height: 24,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2.5,
+                            valueColor: AlwaysStoppedAnimation<Color>(AppColors.accent),
+                          ),
+                        )
+                      : TvFocusable(
+                          onActivate: () => context.read<AppState>().refreshContent(),
+                          borderRadius: 6,
+                          child: OutlinedButton(
+                            onPressed: () => context.read<AppState>().refreshContent(),
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: AppColors.accent,
+                              side: const BorderSide(color: AppColors.accent),
+                              padding: const EdgeInsets.symmetric(horizontal: 16),
+                            ),
+                            child: const Text('Refresh'),
+                          ),
+                        ),
+                ],
+              ),
+            ),
+            const Divider(color: AppColors.border, height: 1),
+          ],
         ),
+
         const SizedBox(height: 24),
         Align(
           alignment: Alignment.centerLeft,
@@ -519,10 +646,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  // ── About Tab ───────────────────────────────────────────────────────────
+  // ── About Tab ─────────────────────────────────────────────────────────
   Widget _buildAboutTab(bool isPhone) {
     return Center(
-      child: Padding(
+      child: SingleChildScrollView(
         padding: EdgeInsets.all(isPhone ? 16 : 40),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -544,7 +671,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
             const SizedBox(height: 8),
             const Text(
-              'Version 2.1.0',
+              'Version 2.2.0',
               style: TextStyle(
                 fontSize: 14,
                 color: AppColors.textSecondary,
@@ -560,13 +687,104 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 height: 1.5,
               ),
             ),
+            const SizedBox(height: 36),
+
+            // ── Restart App card ────────────────────────────────────────────
+            Container(
+              width: double.infinity,
+              constraints: const BoxConstraints(maxWidth: 340),
+              decoration: BoxDecoration(
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                    color: AppColors.accent.withValues(alpha: 0.4), width: 1),
+                color: AppColors.bg2,
+              ),
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Row(
+                    children: [
+                      Icon(Icons.refresh_rounded,
+                          color: AppColors.accent, size: 20),
+                      SizedBox(width: 8),
+                      Text(
+                        'APP CONTROLS',
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                          color: AppColors.accent,
+                          letterSpacing: 1.0,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'Restart App',
+                    style: TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w600,
+                      color: AppColors.textPrimary,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'Fully restarts the app and refreshes all content. '
+                    'Use this if channels stop loading or the app feels sluggish.',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: AppColors.textTertiary,
+                      height: 1.5,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  SizedBox(
+                    width: double.infinity,
+                    child: TvFocusable(
+                      onActivate: _doRestartApp,
+                      borderRadius: 8,
+                      child: ElevatedButton.icon(
+                        onPressed: _doRestartApp,
+                        icon: const Icon(Icons.restart_alt_rounded, size: 20),
+                        label: const Text('Restart App'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: AppColors.accent,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(vertical: 14),
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(8)),
+                          textStyle: const TextStyle(
+                            fontSize: 15,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
           ],
         ),
       ),
     );
   }
 
-  // ── Shared UI Helpers ───────────────────────────────────────────────────
+  /// Invokes the native restartApp channel — fully relaunches the app process.
+  /// Falls back to popping all routes to splash if native call fails.
+  Future<void> _doRestartApp() async {
+    try {
+      await _nativeCh.invokeMethod('restartApp');
+    } catch (e) {
+      debugPrint('[Settings] restartApp failed: $e — falling back to route reset');
+      if (mounted) {
+        Navigator.of(context).popUntil((route) => route.isFirst);
+      }
+    }
+  }
+
+  // ── Shared UI Helpers ─────────────────────────────────────────────────
   Widget _buildSwitchRow({
     required String title,
     String? subtitle,
@@ -576,44 +794,48 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }) {
     return Column(
       children: [
-        Padding(
-          padding: const EdgeInsets.symmetric(vertical: 12),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      title,
-                      style: const TextStyle(
-                        fontSize: 15,
-                        fontWeight: FontWeight.w500,
-                        color: AppColors.textPrimary,
-                      ),
-                    ),
-                    if (subtitle != null) ...[
-                      const SizedBox(height: 4),
+        TvFocusable(
+          onActivate: () => onChanged(!value),
+          borderRadius: 4,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
                       Text(
-                        subtitle,
+                        title,
                         style: const TextStyle(
-                          fontSize: 13,
-                          color: AppColors.textTertiary,
+                          fontSize: 15,
+                          fontWeight: FontWeight.w500,
+                          color: AppColors.textPrimary,
                         ),
                       ),
-                    ]
-                  ],
+                      if (subtitle != null) ...[
+                        const SizedBox(height: 4),
+                        Text(
+                          subtitle,
+                          style: const TextStyle(
+                            fontSize: 13,
+                            color: AppColors.textTertiary,
+                          ),
+                        ),
+                      ]
+                    ],
+                  ),
                 ),
-              ),
-              Switch(
-                value: value,
-                onChanged: onChanged,
-                activeTrackColor: AppColors.accent,
-                inactiveThumbColor: Colors.white,
-                inactiveTrackColor: AppColors.border,
-              ),
-            ],
+                Switch(
+                  value: value,
+                  onChanged: onChanged,
+                  activeTrackColor: AppColors.accent,
+                  inactiveThumbColor: Colors.white,
+                  inactiveTrackColor: AppColors.border,
+                ),
+              ],
+            ),
           ),
         ),
         if (hasDivider) const Divider(color: AppColors.border, height: 1),
@@ -658,14 +880,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
               ),
               if (actionText != null && onTap != null)
-                OutlinedButton(
-                  onPressed: onTap,
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: AppColors.textPrimary,
-                    side: const BorderSide(color: AppColors.border),
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                TvFocusable(
+                  onActivate: onTap,
+                  borderRadius: 6,
+                  child: OutlinedButton(
+                    onPressed: onTap,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: AppColors.textPrimary,
+                      side: const BorderSide(color: AppColors.border),
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                    ),
+                    child: Text(actionText),
                   ),
-                  child: Text(actionText),
                 ),
             ],
           ),

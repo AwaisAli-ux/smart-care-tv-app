@@ -2,9 +2,21 @@
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- WAKE_LOCK: keeps playback alive on all TV boxes, prevents sleep during streaming -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- FOREGROUND_SERVICE: keeps player running on low-RAM boxes (Amlogic, MT, Rockchip) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- RECEIVE_BOOT_COMPLETED: allows app to restart properly after reboot -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Change network state: helps reconnect on flaky hotel/ISP connections -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <!-- TV-specific feature declarations -->
     <uses-feature android:name="android.software.leanback" android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <!-- Declare TV audio support — required for Samsung Tizen-based Android TVs -->
+    <uses-feature android:name="android.hardware.audio.output" android:required="false" />
+    <!-- Bluetooth remote support — Mi Box, SHIELD, generic BT remotes -->
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
     <application
         android:label="Smart Care TV"
         android:name="${applicationName}"
@@ -20,7 +32,9 @@
             android:theme="@style/LaunchTheme"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"
-            android:windowSoftInputMode="adjustResize">
+            android:windowSoftInputMode="adjustResize"
+            android:screenOrientation="landscape"
+            android:supportsPictureInPicture="true">
             <meta-data
               android:name="io.flutter.embedding.android.NormalTheme"
               android:resource="@style/NormalTheme"

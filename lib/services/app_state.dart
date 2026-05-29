@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/content_model.dart';
+import 'iptv_service.dart';
 
 /// These brand keywords define "featured" channels.
 /// Each brand gets ONE representative at the front, interleaved randomly.
@@ -55,6 +56,14 @@ class AppState extends ChangeNotifier {
   bool _isContentLoading = false;
   String? _contentError;
 
+  // ── Player Settings ─────────────────────────────────────────────────────
+  // Default: hardware acceleration OFF for universal TV compatibility.
+  // Software decoding works correctly on ALL chipsets (Amlogic, MediaTek,
+  // Qualcomm, Tegra) — hardware decoding causes scrambled video on many boxes.
+  bool _hardwareAccelEnabled = false;
+  String _bufferSize = 'medium'; // 'small' | 'medium' | 'large'
+  String _selectedQuality = 'Auto (Recommended)';
+
   // ── Getters ─────────────────────────────────────────────────────────────
   bool get isLoggedIn => _isLoggedIn;
   String get username => _username;
@@ -68,15 +77,73 @@ class AppState extends ChangeNotifier {
   bool get isContentLoading => _isContentLoading;
   String? get contentError => _contentError;
   bool get hasContent =>
-      _channels.isNotEmpty || _movies.isNotEmpty || _series.isNotEmpty;
+      _channels.isNotEmpty || _movies.isNotEmpty;
 
   List<ContentItem> get favorites => [
         ..._channels.where((c) => _favoriteIds.contains(c.id)),
         ..._movies.where((m) => _favoriteIds.contains(m.id)),
-        ..._series.where((s) => _favoriteIds.contains(s.id)),
       ];
 
   bool isFavorite(String id) => _favoriteIds.contains(id);
+
+  // Player settings getters
+  bool get hardwareAccelEnabled => _hardwareAccelEnabled;
+  String get bufferSize => _bufferSize;
+  String get selectedQuality => _selectedQuality;
+
+  /// Returns buffer size in bytes for use in PlayerConfiguration.
+  int get bufferBytes {
+    switch (_bufferSize) {
+      case 'small':  return 32  * 1024 * 1024;  // 32 MB
+      case 'large':  return 128 * 1024 * 1024;  // 128 MB
+      case 'medium':
+      default:       return 64  * 1024 * 1024;  // 64 MB
+    }
+  }
+
+  // ── Player Settings Persistence ─────────────────────────────────────────
+  Future<void> loadPlayerSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _hardwareAccelEnabled = prefs.getBool('player_hw_accel') ?? false;
+      _bufferSize = prefs.getString('player_buffer_size') ?? 'medium';
+      _selectedQuality = prefs.getString('player_quality') ?? 'Auto (Recommended)';
+      debugPrint('[PlayerSettings] hwAccel=$_hardwareAccelEnabled bufferSize=$_bufferSize quality=$_selectedQuality');
+      notifyListeners();
+    } catch (e) {
+      debugPrint('[PlayerSettings] Failed to load: $e');
+    }
+  }
+
+  Future<void> _savePlayerSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('player_hw_accel', _hardwareAccelEnabled);
+      await prefs.setString('player_buffer_size', _bufferSize);
+      await prefs.setString('player_quality', _selectedQuality);
+    } catch (e) {
+      debugPrint('[PlayerSettings] Failed to save: $e');
+    }
+  }
+
+  void setHardwareAccel(bool enabled) {
+    _hardwareAccelEnabled = enabled;
+    notifyListeners();
+    _savePlayerSettings();
+  }
+
+  void setBufferSize(String size) {
+    assert(size == 'small' || size == 'medium' || size == 'large');
+    _bufferSize = size;
+    notifyListeners();
+    _savePlayerSettings();
+  }
+
+  void setSelectedQuality(String quality) {
+    _selectedQuality = quality;
+    notifyListeners();
+    _savePlayerSettings();
+  }
 
   // ── Favorites key — scoped per username so each account has its own list ──
   String _favKey(String username) =>
@@ -178,6 +245,40 @@ class AppState extends ChangeNotifier {
   void setSeries(List<ContentItem> series) {
     _series = series;
     notifyListeners();
+  }
+
+  // ── Content refresh ─────────────────────────────────────────────────────
+  bool _isRefreshing = false;
+  bool get isRefreshing => _isRefreshing;
+
+  /// Re-fetches ALL content (channels, movies, series) from the server using
+  /// the currently stored credentials. Call from the Device > Refresh Content button.
+  Future<void> refreshContent() async {
+    if (_isRefreshing || !_isLoggedIn || _username.isEmpty) return;
+    _isRefreshing = true;
+    _isContentLoading = true;
+    _contentError = null;
+    notifyListeners();
+    debugPrint('[AppState] refreshContent() — reloading all content for $_username');
+    try {
+      // Reset category cache so fresh categories are fetched too
+      IptvService.resetCache();
+
+      final results = await Future.wait([
+        IptvService.getLiveChannels(_username, _password),
+        IptvService.getMovies(_username, _password),
+        IptvService.getSeries(_username, _password),
+      ]);
+      setContent(results[0], results[1], results[2]);
+      debugPrint('[AppState] refreshContent() ✅ '
+          '${results[0].length} channels, ${results[1].length} movies, ${results[2].length} series');
+    } catch (e) {
+      debugPrint('[AppState] refreshContent() ❌ $e');
+      setContentError('Refresh failed: $e');
+    } finally {
+      _isRefreshing = false;
+      notifyListeners();
+    }
   }
 
   void logout() {

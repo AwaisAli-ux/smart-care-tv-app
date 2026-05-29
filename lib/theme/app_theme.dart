@@ -128,5 +128,13 @@ class AppTheme {
           contentPadding:
               const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
         ),
+        snackBarTheme: const SnackBarThemeData(
+          contentTextStyle: TextStyle(
+            color: Colors.white,
+            fontFamily: 'Inter',
+            fontSize: 14,
+          ),
+          backgroundColor: AppColors.bg4,
+        ),
       );
 }

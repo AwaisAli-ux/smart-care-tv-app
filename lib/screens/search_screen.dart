@@ -4,9 +4,11 @@ import '../models/content_model.dart';
 import '../services/app_state.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
+import '../widgets/tv_focus.dart';
 
 class SearchScreen extends StatefulWidget {
-  const SearchScreen({super.key});
+  final bool sidebarFocused;
+  const SearchScreen({super.key, this.sidebarFocused = true});
   @override
   State<SearchScreen> createState() => _SearchScreenState();
 }
@@ -15,7 +17,7 @@ class _SearchScreenState extends State<SearchScreen> {
   final _ctrl = TextEditingController();
   String _query = '';
   String _tab = 'All';
-  final _tabs = ['All', 'Live TV', 'Movies', 'Series'];
+  final _tabs = ['All', 'Live TV', 'Movies'];
   final _suggestions = [
     'Sports',
     'News',
@@ -46,14 +48,10 @@ class _SearchScreenState extends State<SearchScreen> {
       case 'Movies':
         pool = appState.movies;
         break;
-      case 'Series':
-        pool = appState.series;
-        break;
       default:
         pool = [
           ...appState.channels,
           ...appState.movies,
-          ...appState.series,
         ];
     }
     return pool
@@ -92,7 +90,7 @@ class _SearchScreenState extends State<SearchScreen> {
                           color: AppColors.textPrimary, fontFamily: 'Inter'),
                       onChanged: (v) => setState(() => _query = v),
                       decoration: InputDecoration(
-                        hintText: 'Search channels, movies, series...',
+                        hintText: 'Search channels, movies...',
                         prefixIcon: const Icon(Icons.search,
                             color: AppColors.textTertiary, size: 20),
                         suffixIcon: _query.isNotEmpty
@@ -124,28 +122,33 @@ class _SearchScreenState extends State<SearchScreen> {
                 itemBuilder: (_, i) {
                   final tab = _tabs[i];
                   final active = tab == _tab;
-                  return InkWell(
-                    onTap: () => setState(() => _tab = tab),
-                    borderRadius: BorderRadius.circular(8),
-                    focusColor: AppColors.accent.withValues(alpha: 0.25),
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 150),
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 16, vertical: 6),
-                      decoration: BoxDecoration(
-                        color: active ? AppColors.accent : Colors.transparent,
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(
-                          color: active ? AppColors.accent : AppColors.border,
+                  return TvFocusable(
+                    autofocus: false,
+                    onActivate: () => setState(() => _tab = tab),
+                    borderRadius: 8,
+                    child: InkWell(
+                      onTap: () => setState(() => _tab = tab),
+                      borderRadius: BorderRadius.circular(8),
+                      focusColor: AppColors.accent.withValues(alpha: 0.25),
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 150),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 16, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: active ? AppColors.accent : Colors.transparent,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                            color: active ? AppColors.accent : AppColors.border,
+                          ),
                         ),
-                      ),
-                      child: Text(
-                        tab,
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight:
-                              active ? FontWeight.w600 : FontWeight.w400,
-                          color: active ? Colors.white : AppColors.textTertiary,
+                        child: Text(
+                          tab,
+                          style: TextStyle(
+                            fontSize: 13,
+                            fontWeight:
+                                active ? FontWeight.w600 : FontWeight.w400,
+                            color: active ? Colors.white : AppColors.textTertiary,
+                          ),
                         ),
                       ),
                     ),
@@ -179,24 +182,31 @@ class _SearchScreenState extends State<SearchScreen> {
             spacing: 8,
             runSpacing: 8,
             children: _suggestions
-                .map((s) => InkWell(
-                      onTap: () {
+                .map((s) => TvFocusable(
+                      onActivate: () {
                         _ctrl.text = s;
                         setState(() => _query = s);
                       },
-                      borderRadius: BorderRadius.circular(20),
-                      focusColor: AppColors.accent.withValues(alpha: 0.25),
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 14, vertical: 7),
-                        decoration: BoxDecoration(
-                          color: AppColors.bg3,
-                          borderRadius: BorderRadius.circular(20),
-                          border: Border.all(color: AppColors.border),
+                      borderRadius: 20,
+                      child: InkWell(
+                        onTap: () {
+                          _ctrl.text = s;
+                          setState(() => _query = s);
+                        },
+                        borderRadius: BorderRadius.circular(20),
+                        focusColor: AppColors.accent.withValues(alpha: 0.25),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 14, vertical: 7),
+                          decoration: BoxDecoration(
+                            color: AppColors.bg3,
+                            borderRadius: BorderRadius.circular(20),
+                            border: Border.all(color: AppColors.border),
+                          ),
+                          child: Text(s,
+                              style: const TextStyle(
+                                  fontSize: 12, color: AppColors.textSecondary)),
                         ),
-                        child: Text(s,
-                            style: const TextStyle(
-                                fontSize: 12, color: AppColors.textSecondary)),
                       ),
                     ))
                 .toList(),

@@ -39,6 +39,9 @@ class _LoginScreenState extends State<LoginScreen> {
       _statusMessage = 'Authenticating...';
     });
 
+    // Always clear cached categories so fresh data is fetched for this session
+    IptvService.resetCache();
+
     bool authSuccess = false;
 
     try {
@@ -115,11 +118,6 @@ class _LoginScreenState extends State<LoginScreen> {
     final mv = await IptvService.getMovies(user, pass)
         .catchError((_) => <ContentItem>[]);
     if (mv.isNotEmpty) appState.setMovies(mv);
-
-    // 4. Load Series and update UI immediately
-    final sr = await IptvService.getSeries(user, pass)
-        .catchError((_) => <ContentItem>[]);
-    if (sr.isNotEmpty) appState.setSeries(sr);
 
     // All done
     appState.setContentLoading(false);

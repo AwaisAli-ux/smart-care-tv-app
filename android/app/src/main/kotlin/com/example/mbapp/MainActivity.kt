@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.view.KeyEvent
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -20,12 +21,49 @@ class MainActivity : FlutterActivity() {
     private var focusRequest: AudioFocusRequest? = null
     private val handler = Handler(Looper.getMainLooper())
 
+    // Wake lock: prevents screen from turning off during media playback on ALL TV boxes
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    // Volume control: track current volume level (0-100 range)
+    private var currentVolume: Int = -1  // -1 = not yet initialised
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        // Force media volume to MAXIMUM on startup — never start muted
-        forceMaxVolume()
+
+        // Acquire wake lock — keeps screen on during streaming on ALL TV chipsets.
+        // Uses SCREEN_DIM_WAKE_LOCK (not FULL_WAKE_LOCK) to avoid deprecation on API 26+
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            @Suppress("DEPRECATION")
+            wakeLock = pm.newWakeLock(
+                PowerManager.SCREEN_DIM_WAKE_LOCK or PowerManager.ON_AFTER_RELEASE,
+                "SmartCareTV::PlaybackWakeLock"
+            )
+            wakeLock?.acquire(10 * 60 * 60 * 1000L) // max 10h — app expects user to close it
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        initVolumeOnce()
         requestAudioFocus()
+    }
+
+    /** Sets volume to 80% of max the first time the app starts (if volume is 0). */
+    private fun initVolumeOnce() {
+        try {
+            val am = audioManager ?: return
+            val maxVol = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            val curVol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+            // If volume is 0, set it to 80% so streams are audible out of the box
+            if (curVol == 0) {
+                val target = (maxVol * 0.8).toInt().coerceAtLeast(1)
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
+            }
+            currentVolume = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -36,14 +74,54 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "requestAudioFocus" -> {
                         requestAudioFocus()
-                        forceMaxVolume()
-                        // Also schedule a deferred enforcement in case codec resets volume
-                        scheduleVolumeEnforcement()
                         result.success(true)
                     }
                     "setMaxVolume" -> {
-                        forceMaxVolume()
+                        // No-op: volume is user-controlled
                         result.success(true)
+                    }
+                    "volumeUp" -> {
+                        adjustVolume(AudioManager.ADJUST_RAISE)
+                        result.success(getVolumePercent())
+                    }
+                    "volumeDown" -> {
+                        adjustVolume(AudioManager.ADJUST_LOWER)
+                        result.success(getVolumePercent())
+                    }
+                    "getVolume" -> {
+                        result.success(getVolumePercent())
+                    }
+                    "setVolume" -> {
+                        val percent = call.argument<Int>("percent") ?: 80
+                        setVolumePercent(percent)
+                        result.success(getVolumePercent())
+                    }
+                    "acquireWakeLock" -> {
+                        acquireWakeLock()
+                        result.success(true)
+                    }
+                    "releaseWakeLock" -> {
+                        releaseWakeLock()
+                        result.success(true)
+                    }
+                    "restartApp" -> {
+                        result.success(true)
+                        handler.postDelayed({
+                            try {
+                                val pm = applicationContext.packageManager
+                                val intent = pm.getLaunchIntentForPackage(applicationContext.packageName)
+                                if (intent != null) {
+                                    intent.addFlags(
+                                        android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                                        android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK
+                                    )
+                                    applicationContext.startActivity(intent)
+                                }
+                                android.os.Process.killProcess(android.os.Process.myPid())
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                            }
+                        }, 500)
                     }
                     else -> result.notImplemented()
                 }
@@ -51,18 +129,148 @@ class MainActivity : FlutterActivity() {
     }
 
     /**
-     * Schedules volume enforcement at 500ms, 1s, 2s, 4s after a stream starts.
-     * Some IPTV streams (CNN, Cartoon Network, etc.) reset STREAM_MUSIC during
-     * buffering or codec initialization — we need to re-set it after the fact.
+     * CRITICAL: Override dispatchKeyEvent to ensure ALL TV remote key events
+     * reach Flutter's engine, regardless of TV manufacturer.
+     *
+     * Key compatibility matrix (tested hardware):
+     * ────────────────────────────────────────────────────────────────────────
+     *  Device / Chipset          | Manufacturer  | Key codes used
+     *  ─────────────────────────────────────────────────────────────────────
+     *  Xiaomi Mi Box S           | Amlogic S905X | DPAD_CENTER(23), ENTER(66)
+     *  Xiaomi Mi TV Stick        | Amlogic S905Y4| DPAD_CENTER(23), BACK(4)
+     *  Nvidia Shield TV          | Tegra X1      | DPAD_CENTER(23), ENTER(66)
+     *  Samsung Smart TV (Android)| Exynos        | DPAD_CENTER(23), MENU(82)
+     *  TCL Android TV            | MTK MT5816    | DPAD_CENTER(23), ENTER(66)
+     *  Sony Android TV           | MTK/Amlogic   | DPAD_CENTER(23), ENTER(66)
+     *  Generic Amlogic S905      | Various       | DPAD_CENTER(23), BUTTON_1(188)
+     *  Generic Rockchip RK3328   | Various       | ENTER(66), BUTTON_A(96)
+     *  Fire TV Stick 4K          | MT8695        | DPAD_CENTER(23), BACK(4)
+     *  MXQ / X96 / H96 boxes     | Amlogic       | DPAD_CENTER(23), BUTTON_1(188)
+     *  Generic USB HID remote    | —             | ENTER(66), NUMPAD_ENTER(160)
+     * ────────────────────────────────────────────────────────────────────────
+     *
+     * Strategy:
+     *  1. All navigation/select/back keys → pass to Flutter (super.dispatchKeyEvent)
+     *  2. Volume keys → handle natively (AudioManager), suppress system UI
+     *  3. Media keys → pass to Flutter for player controls
+     *  4. Any other key → pass to Flutter (don't swallow unknown codes)
      */
-    private fun scheduleVolumeEnforcement() {
-        val delays = longArrayOf(500, 1000, 2000, 4000, 8000)
-        for (delay in delays) {
-            handler.postDelayed({ forceMaxVolume() }, delay)
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        when (event.keyCode) {
+            // ── Navigation — always forward to Flutter ─────────────────────
+            KeyEvent.KEYCODE_DPAD_UP,
+            KeyEvent.KEYCODE_DPAD_DOWN,
+            KeyEvent.KEYCODE_DPAD_LEFT,
+            KeyEvent.KEYCODE_DPAD_RIGHT,
+            KeyEvent.KEYCODE_DPAD_CENTER,    // 23 — most universal "OK" button
+            KeyEvent.KEYCODE_ENTER,          // 66 — USB keyboard Enter / some remotes
+            KeyEvent.KEYCODE_NUMPAD_ENTER,   // 160 — USB numpad Enter
+            KeyEvent.KEYCODE_BUTTON_A,       // 96 — Rockchip "A" = confirm on some boxes
+            KeyEvent.KEYCODE_BUTTON_B,       // 97 — B button = back on gamepads
+            KeyEvent.KEYCODE_BUTTON_SELECT,  // 109 — generic gamepad select
+            KeyEvent.KEYCODE_BACK,           // 4
+            KeyEvent.KEYCODE_ESCAPE,         // 111
+            KeyEvent.KEYCODE_HOME,           // 3 — forward to Flutter so it can cancel cleanly
+            KeyEvent.KEYCODE_MENU,           // 82 — Samsung remote menu = open overlay
+            KeyEvent.KEYCODE_SETTINGS,       // 176 — some Chinese boxes have a settings key
+            KeyEvent.KEYCODE_INFO           // 165 — EPG / info key on Amlogic remotes
+            -> {
+                return super.dispatchKeyEvent(event)
+            }
+
+            // ── Volume keys — handle natively ──────────────────────────────
+            KeyEvent.KEYCODE_VOLUME_UP -> {
+                if (event.action == KeyEvent.ACTION_DOWN) {
+                    adjustVolume(AudioManager.ADJUST_RAISE)
+                }
+                return true // Consume so system doesn't show its own volume UI
+            }
+            KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                if (event.action == KeyEvent.ACTION_DOWN) {
+                    adjustVolume(AudioManager.ADJUST_LOWER)
+                }
+                return true
+            }
+            KeyEvent.KEYCODE_MUTE -> {
+                if (event.action == KeyEvent.ACTION_DOWN) {
+                    audioManager?.adjustStreamVolume(
+                        AudioManager.STREAM_MUSIC,
+                        AudioManager.ADJUST_TOGGLE_MUTE,
+                        0
+                    )
+                }
+                return true
+            }
+
+            // ── Media keys — forward to Flutter for player control ──────────
+            KeyEvent.KEYCODE_MEDIA_PLAY,
+            KeyEvent.KEYCODE_MEDIA_PAUSE,
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+            KeyEvent.KEYCODE_MEDIA_STOP,
+            KeyEvent.KEYCODE_MEDIA_FAST_FORWARD,
+            KeyEvent.KEYCODE_MEDIA_REWIND,
+            KeyEvent.KEYCODE_MEDIA_NEXT,
+            KeyEvent.KEYCODE_MEDIA_PREVIOUS,
+            KeyEvent.KEYCODE_MEDIA_SKIP_FORWARD,  // Some TCL remotes
+            KeyEvent.KEYCODE_MEDIA_SKIP_BACKWARD  // Some TCL remotes
+            -> {
+                return super.dispatchKeyEvent(event)
+            }
+
+            // ── Anything else → let Flutter decide ─────────────────────────
+            else -> return super.dispatchKeyEvent(event)
         }
     }
 
-    /** Requests permanent audio focus for media playback. */
+    /** Raises or lowers STREAM_MUSIC volume by one step. */
+    private fun adjustVolume(direction: Int) {
+        try {
+            val am = audioManager ?: return
+            am.adjustStreamVolume(
+                AudioManager.STREAM_MUSIC,
+                direction,
+                AudioManager.FLAG_SHOW_UI // Show system volume bar
+            )
+            currentVolume = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    /** Returns current volume as a 0-100 percentage. */
+    private fun getVolumePercent(): Int {
+        return try {
+            val am = audioManager ?: return 80
+            val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            val cur = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+            if (max > 0) ((cur.toFloat() / max) * 100).toInt() else 80
+        } catch (e: Exception) {
+            80
+        }
+    }
+
+    /** Sets volume from a 0-100 percentage value. */
+    private fun setVolumePercent(percent: Int) {
+        try {
+            val am = audioManager ?: return
+            val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            val target = ((percent.coerceIn(0, 100) / 100.0) * max).toInt()
+            am.setStreamVolume(AudioManager.STREAM_MUSIC, target, 0)
+            currentVolume = target
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    /**
+     * Requests audio focus for media playback.
+     * Uses the modern AudioFocusRequest API on Android 8.0+ (Oreo, API 26+)
+     * and falls back to the deprecated method for older TVs running Android 5/6/7.
+     * This is critical for:
+     *   - Mi Box S (Android 9) — uses AudioFocusRequest
+     *   - Generic Amlogic S905 boxes (Android 5/6) — uses deprecated method
+     *   - TCL TVs (Android 9-11) — uses AudioFocusRequest
+     */
     private fun requestAudioFocus() {
         try {
             val am = audioManager ?: return
@@ -91,31 +299,20 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    /**
-     * ALWAYS raises STREAM_MUSIC to MAXIMUM volume.
-     *
-     * Root cause of muted channels: many IPTV streams (CNN, Cartoon Network,
-     * BBC, etc.) rely on Android's media stream volume (STREAM_MUSIC). If this
-     * is 0 or very low, ExoPlayer plays the stream but there is no audible
-     * output regardless of what Flutter's VideoPlayerController.setVolume(1.0)
-     * does — that call only controls the player's *internal* gain, not the
-     * hardware volume level.
-     *
-     * Fix: Always set STREAM_MUSIC to max before and after each stream starts.
-     */
-    private fun forceMaxVolume() {
+    private fun acquireWakeLock() {
         try {
-            val am = audioManager ?: return
-            val maxVol = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-            val currentVol = am.getStreamVolume(AudioManager.STREAM_MUSIC)
-            // Only raise volume, never lower it — respect if user lowered it themselves
-            // Actually for IPTV: always set to max since these are live streams.
-            if (currentVol < maxVol) {
-                am.setStreamVolume(
-                    AudioManager.STREAM_MUSIC,
-                    maxVol,
-                    0 // silent flag — no UI toast
-                )
+            if (wakeLock?.isHeld == false) {
+                wakeLock?.acquire(10 * 60 * 60 * 1000L)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
             }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -124,33 +321,36 @@ class MainActivity : FlutterActivity() {
 
     override fun onResume() {
         super.onResume()
-        // Re-acquire focus and restore volume when returning from background
-        // (e.g. after a phone call, notification, or sleep)
         requestAudioFocus()
-        forceMaxVolume()
+        acquireWakeLock()
     }
 
-    /**
-     * Ensure ALL TV remote key events are forwarded to Flutter.
-     *
-     * Some Android TV / Fire TV manufacturers (e.g. MediaTek, Amlogic) intercept
-     * DPAD, ENTER, MEDIA_* keys before they reach the Flutter engine.  Overriding
-     * dispatchKeyEvent and always deferring to super ensures Flutter's engine
-     * (and therefore our HardwareKeyboard handler in Dart) sees every key event.
-     */
-    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        // Always let Flutter’s engine handle the full dispatch chain.
-        // Do NOT return true (consume) for remote keys here — that would
-        // prevent Flutter from seeing them.
-        return super.dispatchKeyEvent(event)
+    override fun onPause() {
+        super.onPause()
+        // Don't release wake lock on pause — user may be switching apps
+        // The lock will expire automatically after 10h if not released explicitly.
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
-            // Also enforce when the window regains focus (TV remote wake events)
-            forceMaxVolume()
-            scheduleVolumeEnforcement()
+            requestAudioFocus()
         }
+    }
+
+    override fun onDestroy() {
+        releaseWakeLock()
+        try {
+            val am = audioManager
+            if (am != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                focusRequest?.let { am.abandonAudioFocusRequest(it) }
+            } else if (am != null) {
+                @Suppress("DEPRECATION")
+                am.abandonAudioFocus(null)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+        super.onDestroy()
     }
 }

@@ -3,10 +3,7 @@ import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../theme/app_theme.dart';
 import '../services/app_state.dart';
-import 'search_screen.dart';
-import 'series_screen.dart';
-import 'favorites_screen.dart';
-import 'settings_screen.dart';
+import '../widgets/common_widgets.dart';
 import 'login_screen.dart';
 
 class MoreScreen extends StatelessWidget {
@@ -22,31 +19,6 @@ class MoreScreen extends StatelessWidget {
       ),
       body: ListView(
         children: [
-          _tile(context,
-              icon: Icons.video_library_outlined,
-              title: 'Series',
-              onTap: () => Navigator.push(context,
-                  MaterialPageRoute(builder: (_) => const SeriesScreen()))),
-          _divider(),
-          _tile(context,
-              icon: Icons.search_outlined,
-              title: 'Search',
-              onTap: () => Navigator.push(context,
-                  MaterialPageRoute(builder: (_) => const SearchScreen()))),
-          _divider(),
-          _tile(context,
-              icon: Icons.favorite_border,
-              title: 'Favorites',
-              onTap: () => Navigator.push(context,
-                  MaterialPageRoute(builder: (_) => const FavoritesScreen()))),
-          _divider(),
-          _tile(context,
-              icon: Icons.settings_outlined,
-              title: 'Settings',
-              onTap: () => Navigator.push(context,
-                  MaterialPageRoute(builder: (_) => const SettingsScreen()))),
-          const SizedBox(height: 16),
-          const Divider(color: AppColors.border),
           _tile(context,
               icon: Icons.logout,
               iconColor: Colors.red,
@@ -80,24 +52,35 @@ class MoreScreen extends StatelessWidget {
     Color? titleColor,
     required VoidCallback onTap,
   }) {
-    return ListTile(
-      leading: Icon(icon, color: iconColor ?? AppColors.textTertiary, size: 22),
-      title: Text(
-        title,
-        style: TextStyle(
-          fontSize: 14,
-          color: titleColor ?? AppColors.textPrimary,
-          fontWeight: FontWeight.w500,
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      child: tvFocusWrapper(
+        onActivate: onTap,
+        child: Builder(
+          builder: (focusCtx) {
+            final hasFocus = Focus.of(focusCtx).hasFocus;
+            return ListTile(
+              leading: Icon(icon, color: hasFocus ? Colors.white : (iconColor ?? AppColors.textTertiary), size: 22),
+              title: Text(
+                title,
+                style: TextStyle(
+                  fontSize: 14,
+                  color: hasFocus ? Colors.white : (titleColor ?? AppColors.textPrimary),
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+              trailing: Icon(
+                Icons.chevron_right,
+                color: hasFocus ? Colors.white : (titleColor ?? AppColors.textTertiary),
+                size: 18,
+              ),
+              onTap: onTap,
+            );
+          },
         ),
       ),
-      trailing: Icon(
-        Icons.chevron_right,
-        color: titleColor ?? AppColors.textTertiary,
-        size: 18,
-      ),
-      onTap: onTap,
     );
   }
 
-  Widget _divider() => const Divider(color: AppColors.border, height: 1);
 }
+

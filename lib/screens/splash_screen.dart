@@ -95,11 +95,6 @@ class _SplashScreenState extends State<SplashScreen>
         .catchError((_) => <ContentItem>[]);
     if (mv.isNotEmpty) appState.setMovies(mv);
 
-    // 4. Load Series and update UI immediately
-    final sr = await IptvService.getSeries(username, password)
-        .catchError((_) => <ContentItem>[]);
-    if (sr.isNotEmpty) appState.setSeries(sr);
-
     // All done
     appState.setContentLoading(false);
   }

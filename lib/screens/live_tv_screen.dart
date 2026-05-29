@@ -3,35 +3,14 @@
 // ============================================================
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import '../models/content_model.dart';
+
 import '../services/app_state.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
 
-class LiveTvScreen extends StatefulWidget {
-  const LiveTvScreen({super.key});
-  @override
-  State<LiveTvScreen> createState() => _LiveTvScreenState();
-}
-
-class _LiveTvScreenState extends State<LiveTvScreen> {
-  String _selectedCat = 'All';
-
-  List<String> _cats(List<ContentItem> channels) {
-    final catSet = <String>{};
-    for (final c in channels) {
-      catSet.add(c.category ?? 'Uncategorized');
-    }
-    final sorted = catSet.toList()..sort();
-    return ['All', ...sorted];
-  }
-
-  List<ContentItem> _filtered(List<ContentItem> channels) {
-    if (_selectedCat == 'All') return channels;
-    return channels
-        .where((c) => (c.category ?? 'Uncategorized') == _selectedCat)
-        .toList();
-  }
+class LiveTvScreen extends StatelessWidget {
+  final bool sidebarFocused;
+  const LiveTvScreen({super.key, this.sidebarFocused = true});
 
   @override
   Widget build(BuildContext context) {
@@ -84,42 +63,22 @@ class _LiveTvScreenState extends State<LiveTvScreen> {
       );
     }
 
-    final cats = _cats(channels);
-    final filtered = _filtered(channels);
-
     return Scaffold(
       backgroundColor: AppColors.bg,
       appBar: AppBar(
-        title: Text('Live TV (${channels.length})'),
+        title: const Text('Live TV'),
         backgroundColor: AppColors.bg2,
-        actions: [
-          IconButton(
-              icon: const Icon(Icons.calendar_today_outlined),
-              onPressed: () {}),
-        ],
       ),
       body: Column(
         children: [
           const SizedBox(height: 8),
-          FilterChipsRow(
-              categories: cats,
-              selected: _selectedCat,
-              onSelect: (c) => setState(() => _selectedCat = c)),
-          const SizedBox(height: 8),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: Text(
-                '${filtered.length} channels',
-                style: const TextStyle(
-                    color: AppColors.textTertiary, fontSize: 11),
-              ),
-            ),
-          ),
-          const SizedBox(height: 4),
           Expanded(
-            child: ChannelGrid(items: filtered),
+            // autoFocusFirst is intentionally false — focus only enters
+            // the grid when the user presses Right/Enter on the sidebar.
+            child: ChannelGrid(
+              items: channels,
+              autoFocusFirst: false,
+            ),
           ),
         ],
       ),

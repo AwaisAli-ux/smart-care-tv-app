@@ -13,8 +13,11 @@ List<dynamic> _parseJsonList(String body) {
       for (final value in decoded.values) {
         if (value is List) return value;
       }
+      return decoded.values.toList();
     }
-  } catch (_) {}
+  } catch (e) {
+    debugPrint('[JSON Parser] Error decoding: $e');
+  }
   return [];
 }
 
@@ -32,11 +35,33 @@ class IptvService {
       'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
 
+  /// Standard HTTP headers sent with EVERY stream request.
+  /// Covers Xtream-compatible servers, HLS proxies, and CDN-backed streams.
+  static const Map<String, String> streamHeaders = {
+    'User-Agent': _ua,
+    'Accept': '*/*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Connection': 'keep-alive',
+    'Referer': '$baseUrl/',
+    'Origin': baseUrl,
+    'Icy-MetaData': '1',                // Request ICY metadata for radio/audio streams
+    'X-Requested-With': 'XMLHttpRequest',
+  };
+
   // ── Cached category maps ──────────────────────────────────────────────────
   static Map<String, String> _liveCats = {};
   static Map<String, String> _vodCats = {};
   static Map<String, String> _seriesCats = {};
   static Future<void>? _categoriesFuture;
+
+  /// Reset all cached data (call on logout/re-login to prevent stale data)
+  static void resetCache() {
+    _liveCats = {};
+    _vodCats = {};
+    _seriesCats = {};
+    _categoriesFuture = null;
+    debugPrint('[IptvService] Cache reset');
+  }
 
   // ── Persistent HTTP client for connection reuse (much faster on slow nets)
   static final http.Client _client = http.Client();
@@ -47,14 +72,52 @@ class IptvService {
     'Connection': 'keep-alive',
   };
 
-  // ── HTTP helper with auto-retry ───────────────────────────────────────────
+  // ── HTTP helper with auto-retry (exponential back-off) ────────────────────
   static Future<http.Response> _get(Uri url,
       {Duration timeout = const Duration(seconds: 30)}) async {
     try {
       return await _client.get(url, headers: _headers).timeout(timeout);
-    } catch (_) {
-      await Future.delayed(const Duration(seconds: 2));
-      return await _client.get(url, headers: _headers).timeout(timeout);
+    } catch (e) {
+      debugPrint('[HTTP] First attempt failed ($url): $e — retrying in 3s');
+      await Future.delayed(const Duration(seconds: 3));
+      try {
+        return await _client.get(url, headers: _headers).timeout(timeout);
+      } catch (e2) {
+        debugPrint('[HTTP] Second attempt failed ($url): $e2 — retrying in 5s');
+        await Future.delayed(const Duration(seconds: 5));
+        return await _client.get(url, headers: _headers).timeout(timeout);
+      }
+    }
+  }
+
+  // ── Fast stream health check ───────────────────────────────────────────────
+  /// Sends a HEAD (falling back to GET with a tiny range) to [url] and returns
+  /// true if the server responds with a non-4xx, non-5xx status code.
+  /// Timeout is 5 seconds — just enough to skip clearly dead URLs before
+  /// the media player spends 20s waiting on them.
+  static Future<bool> streamHealthCheck(String url) async {
+    try {
+      final uri = Uri.parse(url);
+      // Try HEAD first (no body downloaded)
+      final head = await _client
+          .head(uri, headers: {
+            ..._headers,
+            'User-Agent': _ua,
+            'Referer': '$baseUrl/',
+            'Range': 'bytes=0-1023', // request tiny range
+          })
+          .timeout(const Duration(seconds: 5));
+      final code = head.statusCode;
+      if (code == 403 || code == 404 || code >= 500) {
+        debugPrint('[HealthCheck] ❌ $code for $url');
+        return false;
+      }
+      debugPrint('[HealthCheck] ✅ $code for $url');
+      return true;
+    } catch (e) {
+      debugPrint('[HealthCheck] ⚠ timeout/error for $url: $e');
+      // Don't skip on timeout — server might accept player but not HEAD requests
+      return true;
     }
   }
 
@@ -121,8 +184,8 @@ class IptvService {
     try {
       final url = Uri.parse(
           '$baseUrl/player_api.php?username=$username&password=$password&action=get_live_streams');
-      // 45s — live stream lists can be very large on big providers
-      final response = await _get(url, timeout: const Duration(seconds: 45));
+      // 60s — live stream lists can be very large on big providers
+      final response = await _get(url, timeout: const Duration(seconds: 60));
       if (response.statusCode == 200) {
         await ensureCategoriesLoaded(username, password);
         final List<dynamic> data =
@@ -155,14 +218,22 @@ class IptvService {
     try {
       final url = Uri.parse(
           '$baseUrl/player_api.php?username=$username&password=$password&action=get_vod_streams');
-      // 60s — VOD lists can have 10 000+ items (large JSON body)
-      final response = await _get(url, timeout: const Duration(seconds: 60));
+      debugPrint('[IPTV Service] Fetching movies from: $url');
+      // 90s — VOD catalogues can be extremely large (10k+ entries)
+      final response = await _get(url, timeout: const Duration(seconds: 90));
+      debugPrint('[IPTV Service] Movies response: statusCode=${response.statusCode}, bodyLength=${response.body.length}');
       if (response.statusCode == 200 && response.body.isNotEmpty) {
+        if (response.body.length < 500) {
+          debugPrint('[IPTV Service] Movies response body: ${response.body}');
+        } else {
+          debugPrint('[IPTV Service] Movies response body start: ${response.body.substring(0, 300)}');
+        }
         await ensureCategoriesLoaded(username, password);
         final List<dynamic> data =
             await compute(_parseJsonList, response.body);
+        debugPrint('[IPTV Service] Parsed movie items count: ${data.length}');
         final cats = Map<String, String>.from(_vodCats);
-        return data
+        final list = data
             .where((item) =>
                 item is Map &&
                 item['stream_id'] != null &&
@@ -186,9 +257,11 @@ class IptvService {
             containerExtension: ext.isEmpty ? 'mp4' : ext,
           );
         }).toList();
+        debugPrint('[IPTV Service] Mapped movie ContentItems count: ${list.length}');
+        return list;
       }
-    } catch (e) {
-      debugPrint('Error fetching movies: $e');
+    } catch (e, stack) {
+      debugPrint('Error fetching movies: $e\n$stack');
     }
     return [];
   }
@@ -347,15 +420,58 @@ class IptvService {
           String username, String password, String streamId) =>
       '$baseUrl/live/$username/$password/$streamId.ts';
 
-  /// No-extension live URL — some servers prefer this over .m3u8
+  /// No-extension live URL — many Xtream servers serve via redirect from this form
   static String getLiveStreamUrlNoExt(
           String username, String password, String streamId) =>
       '$baseUrl/live/$username/$password/$streamId';
+
+  /// Returns ALL live URL candidates in the most-likely-to-work order.
+  ///
+  /// Extended candidate list for maximum cross-device compatibility:
+  ///   1. Bare URL (Xtream redirect) — most compatible, server picks best format
+  ///   2. .m3u8 — HLS, works on Mi Box, Shield, TCL Android TV (API 16+)
+  ///   3. .ts — MPEG-TS, required for old Amlogic S905 boxes running Android 5
+  ///   4. .m3u8 with direct path variant — some IPTV panels use different paths
+  ///   5. Explicit bare fallback — catches Xtream servers that don't auto-redirect
+  ///
+  /// The health-check will quickly skip dead URLs, so adding more candidates
+  /// costs only a few hundred milliseconds when the first URL works.
+  static List<String> getLiveStreamUrlCandidates(
+          String username, String password, String streamId) =>
+      [
+        getLiveStreamUrlNoExt(username, password, streamId), // bare  — most compatible
+        getLiveStreamUrl(username, password, streamId),      // .m3u8 — HLS (most TVs)
+        getLiveStreamUrlTs(username, password, streamId),    // .ts   — MPEG-TS (old boxes)
+        // Additional HLS with different quality hint path (some Xtream variants)
+        '$baseUrl/hls/$username/$password/$streamId.m3u8',
+        // Explicit bare fallback in case redirect is broken
+        '$baseUrl/live/$username/$password/$streamId',
+      ];
 
   static String getMovieStreamUrl(
       String username, String password, String streamId,
       [String ext = 'mp4']) =>
       '$baseUrl/movie/$username/$password/$streamId.$ext';
+
+  /// Returns ALL movie URL candidates in order of likelihood.
+  ///
+  /// Extended to include additional fallbacks for TV boxes that need specific container
+  /// formats. Old Amlogic boxes may not decode MKV headers correctly, so MP4 is
+  /// always the safest fallback. We also try the bare URL (server redirect) last.
+  static List<String> getMovieStreamUrlCandidates(
+      String username, String password, String streamId,
+      [String declaredExt = 'mp4']) {
+    final ext = declaredExt.toLowerCase().isEmpty ? 'mp4' : declaredExt.toLowerCase();
+    // Declared extension first, then the two most common fallbacks
+    final exts = <String>[ext];
+    for (final e in ['mp4', 'mkv', 'avi']) {
+      if (!exts.contains(e)) exts.add(e);
+    }
+    return [
+      ...exts.map((e) => getMovieStreamUrl(username, password, streamId, e)),
+      '$baseUrl/movie/$username/$password/$streamId', // bare fallback
+    ];
+  }
 
   static String getSeriesStreamUrl(
           String username, String password, String episodeIdWithExt) =>

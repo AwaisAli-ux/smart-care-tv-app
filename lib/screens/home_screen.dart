@@ -1,14 +1,19 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import '../models/content_model.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
+import '../widgets/tv_focus.dart';
 import '../services/app_state.dart';
 import 'detail_screen.dart';
+import 'channel_player_screen.dart';
+import 'movie_player_screen.dart';
 
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key});
+  final bool sidebarFocused;
+  const HomeScreen({super.key, this.sidebarFocused = true});
   @override
   State<HomeScreen> createState() => _HomeScreenState();
 }
@@ -17,16 +22,16 @@ class _HomeScreenState extends State<HomeScreen> {
   int _heroIndex = 0;
   late final PageController _pageCtrl;
   int _heroLength = 4;
+  final FocusNode _heroBtnFocusNode = FocusNode(debugLabel: 'HeroBtn');
 
   @override
   void initState() {
     super.initState();
     _pageCtrl = PageController();
-    // Auto-rotate hero
     Future.doWhile(() async {
       await Future.delayed(const Duration(seconds: 5));
       if (!mounted) return false;
-      if (_heroLength == 0) return true; // wait for content
+      if (_heroLength == 0) return true;
       final next = (_heroIndex + 1) % _heroLength;
       if (_pageCtrl.hasClients) {
         _pageCtrl.animateToPage(next,
@@ -38,8 +43,21 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   @override
+  void didUpdateWidget(HomeScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.sidebarFocused && !widget.sidebarFocused) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _heroBtnFocusNode.requestFocus();
+        }
+      });
+    }
+  }
+
+  @override
   void dispose() {
     _pageCtrl.dispose();
+    _heroBtnFocusNode.dispose();
     super.dispose();
   }
 
@@ -48,10 +66,8 @@ class _HomeScreenState extends State<HomeScreen> {
     final appState = context.watch<AppState>();
     final channels = appState.channels;
     final movies = appState.movies;
-    final series = appState.series;
     final isLoading = appState.isContentLoading;
 
-    // If still loading, show loading screen
     if (isLoading && !appState.hasContent) {
       return Scaffold(
         backgroundColor: AppColors.bg,
@@ -85,7 +101,6 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
 
-    // Error state
     if (appState.contentError != null && !appState.hasContent) {
       return Scaffold(
         backgroundColor: AppColors.bg,
@@ -111,13 +126,12 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
 
-    // Build hero items from actual content
     final heroItems = <ContentItem>[];
     if (movies.length > 1) heroItems.add(movies[1]);
     if (channels.isNotEmpty) heroItems.add(channels.first);
-    if (series.isNotEmpty) heroItems.add(series.first);
     if (movies.length > 3) heroItems.add(movies[3]);
     if (movies.length > 5) heroItems.add(movies[5]);
+    if (movies.length > 8) heroItems.add(movies[8]);
     _heroLength = heroItems.length;
 
     return Scaffold(
@@ -132,6 +146,8 @@ class _HomeScreenState extends State<HomeScreen> {
               controller: _pageCtrl,
               onPageChanged: (i) => setState(() => _heroIndex = i),
               heroIndex: _heroIndex,
+              heroBtnFocusNode: _heroBtnFocusNode,
+              autofocus: !widget.sidebarFocused,
             )),
 
           // Loading indicator at top when refreshing in background
@@ -190,28 +206,6 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ],
 
-          // Popular Series — show up to 20
-          if (series.isNotEmpty) ...[
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 20, 16, 12),
-                child: SectionHeader(title: 'Popular Series'),
-              ),
-            ),
-            SliverToBoxAdapter(
-              child: SizedBox(
-                height: 200,
-                child: ListView.separated(
-                  scrollDirection: Axis.horizontal,
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
-                  itemCount: series.length > 20 ? 20 : series.length,
-                  separatorBuilder: (_, __) => const SizedBox(width: 12),
-                  itemBuilder: (_, i) => MediaCard(item: series[i]),
-                ),
-              ),
-            ),
-          ],
-
           // Trending Movies (offset set for variety)
           if (movies.length > 20) ...[
             SliverToBoxAdapter(
@@ -256,28 +250,6 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ],
 
-          // More Series
-          if (series.length > 20) ...[
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 20, 16, 12),
-                child: SectionHeader(title: 'Top Series'),
-              ),
-            ),
-            SliverToBoxAdapter(
-              child: SizedBox(
-                height: 200,
-                child: ListView.separated(
-                  scrollDirection: Axis.horizontal,
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
-                  itemCount: series.length > 40 ? 20 : series.length - 20,
-                  separatorBuilder: (_, __) => const SizedBox(width: 12),
-                  itemBuilder: (_, i) => MediaCard(item: series[i + 20]),
-                ),
-              ),
-            ),
-          ],
-
           const SliverToBoxAdapter(child: SizedBox(height: 24)),
         ],
       ),
@@ -291,11 +263,17 @@ class _HeroBanner extends StatelessWidget {
   final PageController controller;
   final ValueChanged<int> onPageChanged;
   final int heroIndex;
-  const _HeroBanner(
-      {required this.items,
-      required this.controller,
-      required this.onPageChanged,
-      required this.heroIndex});
+  final FocusNode heroBtnFocusNode;
+  final bool autofocus;
+
+  const _HeroBanner({
+    required this.items,
+    required this.controller,
+    required this.onPageChanged,
+    required this.heroIndex,
+    required this.heroBtnFocusNode,
+    required this.autofocus,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -308,7 +286,11 @@ class _HeroBanner extends StatelessWidget {
             controller: controller,
             onPageChanged: onPageChanged,
             itemCount: items.length,
-            itemBuilder: (_, i) => _HeroSlide(item: items[i]),
+            itemBuilder: (_, i) => _HeroSlide(
+              item: items[i],
+              focusNode: i == heroIndex ? heroBtnFocusNode : null,
+              autofocus: autofocus && i == heroIndex,
+            ),
           ),
           // Dots
           Positioned(
@@ -339,18 +321,36 @@ class _HeroBanner extends StatelessWidget {
 
 class _HeroSlide extends StatelessWidget {
   final ContentItem item;
-  const _HeroSlide({required this.item});
+  final FocusNode? focusNode;
+  final bool autofocus;
+
+  const _HeroSlide({
+    required this.item,
+    this.focusNode,
+    this.autofocus = false,
+  });
+
+  void _open(BuildContext context) {
+    if (item.isLive) {
+      Navigator.push(
+          context, MaterialPageRoute(builder: (_) => ChannelPlayerScreen(item: item)));
+    } else if (item.isMovie) {
+      Navigator.push(
+          context, MaterialPageRoute(builder: (_) => MoviePlayerScreen(item: item)));
+    } else {
+      Navigator.push(
+          context, MaterialPageRoute(builder: (_) => DetailScreen(item: item)));
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    return InkWell(
-      onTap: () => Navigator.push(
-          context, MaterialPageRoute(builder: (_) => DetailScreen(item: item))),
-      focusColor: AppColors.accent.withValues(alpha: 0.15),
-      hoverColor: Colors.transparent,
+    return GestureDetector(
+      onTap: () => _open(context),
       child: Stack(
         fit: StackFit.expand,
         children: [
+          // Background image
           if (item.imageUrl.isNotEmpty)
             CachedNetworkImage(
                 imageUrl: item.imageUrl,
@@ -361,16 +361,17 @@ class _HeroSlide extends StatelessWidget {
                 errorWidget: (_, __, ___) => Container(color: AppColors.bg4))
           else
             Container(color: AppColors.bg4),
-          // Gradient overlay
+
+          // Gradient overlays
           Container(
             decoration: BoxDecoration(
               gradient: LinearGradient(
                 begin: Alignment.centerLeft,
                 end: Alignment.centerRight,
                 colors: [
-                  AppColors.bg.withOpacity(0.97),
-                  AppColors.bg.withOpacity(0.6),
-                  AppColors.bg.withOpacity(0.05),
+                  AppColors.bg.withValues(alpha: 0.97),
+                  AppColors.bg.withValues(alpha: 0.6),
+                  AppColors.bg.withValues(alpha: 0.05),
                 ],
               ),
             ),
@@ -380,11 +381,12 @@ class _HeroSlide extends StatelessWidget {
               gradient: LinearGradient(
                 begin: Alignment.bottomCenter,
                 end: Alignment.topCenter,
-                colors: [AppColors.bg.withOpacity(0.8), Colors.transparent],
+                colors: [AppColors.bg.withValues(alpha: 0.8), Colors.transparent],
               ),
             ),
           ),
-          // Content
+
+          // Content overlay — title + buttons
           Positioned(
             left: 24,
             bottom: 32,
@@ -414,8 +416,7 @@ class _HeroSlide extends StatelessWidget {
                         shadows: [
                           Shadow(blurRadius: 8, color: Colors.black54)
                         ])),
-                if (item.description != null &&
-                    item.description!.isNotEmpty) ...[
+                if (item.description != null && item.description!.isNotEmpty) ...[
                   const SizedBox(height: 6),
                   Text(item.description!,
                       maxLines: 2,
@@ -426,50 +427,81 @@ class _HeroSlide extends StatelessWidget {
                           height: 1.4)),
                 ],
                 const SizedBox(height: 12),
+
+                // ── TV-focusable action buttons ──────────────────────────
                 Builder(
                   builder: (ctx) {
                     final appState = Provider.of<AppState>(ctx);
                     final isFav = appState.isFavorite(item.id);
-                    return Row(children: [
-                      ElevatedButton.icon(
-                        onPressed: () => Navigator.push(
-                            ctx,
-                            MaterialPageRoute(
-                                builder: (_) => DetailScreen(item: item))),
-                        icon: const Icon(Icons.play_arrow, size: 18),
-                        label: const Text('Watch Now'),
-                        style: ElevatedButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 16, vertical: 10)),
-                      ),
-                      const SizedBox(width: 10),
-                      OutlinedButton.icon(
-                        onPressed: () {
-                          appState.toggleFavorite(item);
-                          ScaffoldMessenger.of(ctx).showSnackBar(SnackBar(
-                            content: Text(isFav
-                                ? 'Removed from My List'
-                                : 'Added to My List'),
-                            backgroundColor: AppColors.bg4,
-                            duration: const Duration(seconds: 2),
-                          ));
-                        },
-                        icon: Icon(
-                          isFav ? Icons.check : Icons.add,
-                          size: 16,
+                    return FocusTraversalGroup(
+                      policy: OrderedTraversalPolicy(),
+                      child: Row(children: [
+                        // Watch Now — autofocus so D-pad lands here first
+                        FocusTraversalOrder(
+                          order: const NumericFocusOrder(1),
+                          child: TvFocusable(
+                            focusNode: focusNode,
+                            autofocus: autofocus,
+                            scaleOnFocus: true,
+                            showFocusBorder: false,
+                            onActivate: () => _open(ctx),
+                            child: ElevatedButton.icon(
+                              onPressed: () => _open(ctx),
+                              icon: const Icon(Icons.play_arrow, size: 18),
+                              label: const Text('Watch Now'),
+                              style: ElevatedButton.styleFrom(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 16, vertical: 10)),
+                            ),
+                          ),
                         ),
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: Colors.white,
-                          side: BorderSide(
-                              color: isFav
-                                  ? AppColors.accent
-                                  : AppColors.border),
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 16, vertical: 10),
+                        const SizedBox(width: 10),
+                        // My List
+                        FocusTraversalOrder(
+                          order: const NumericFocusOrder(2),
+                          child: TvFocusable(
+                            scaleOnFocus: true,
+                            showFocusBorder: false,
+                            onActivate: () {
+                              appState.toggleFavorite(item);
+                              ScaffoldMessenger.of(ctx).showSnackBar(SnackBar(
+                                content: Text(isFav
+                                    ? 'Removed from My List'
+                                    : 'Added to My List'),
+                                backgroundColor: AppColors.bg4,
+                                duration: const Duration(seconds: 2),
+                              ));
+                            },
+                            child: OutlinedButton.icon(
+                              onPressed: () {
+                                appState.toggleFavorite(item);
+                                ScaffoldMessenger.of(ctx).showSnackBar(SnackBar(
+                                  content: Text(isFav
+                                      ? 'Removed from My List'
+                                      : 'Added to My List'),
+                                  backgroundColor: AppColors.bg4,
+                                  duration: const Duration(seconds: 2),
+                                ));
+                              },
+                              icon: Icon(
+                                isFav ? Icons.check : Icons.add,
+                                size: 16,
+                              ),
+                              style: OutlinedButton.styleFrom(
+                                foregroundColor: Colors.white,
+                                side: BorderSide(
+                                    color: isFav
+                                        ? AppColors.accent
+                                        : AppColors.border),
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 16, vertical: 10),
+                              ),
+                              label: Text(isFav ? 'Saved' : 'My List'),
+                            ),
+                          ),
                         ),
-                        label: Text(isFav ? 'Saved' : 'My List'),
-                      ),
-                    ]);
+                      ]),
+                    );
                   },
                 ),
               ],

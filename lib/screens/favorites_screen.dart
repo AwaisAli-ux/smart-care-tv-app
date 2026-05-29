@@ -5,7 +5,8 @@ import '../services/app_state.dart';
 import '../widgets/common_widgets.dart';
 
 class FavoritesScreen extends StatelessWidget {
-  const FavoritesScreen({super.key});
+  final bool sidebarFocused;
+  const FavoritesScreen({super.key, this.sidebarFocused = true});
 
   @override
   Widget build(BuildContext context) {
@@ -49,7 +50,12 @@ class FavoritesScreen extends StatelessWidget {
                 ],
               ),
             )
-          : ContentGrid(items: favs),
+          // autoFocusFirst is intentionally false — focus only enters
+          // the grid when the user presses Right/Enter on the sidebar.
+          : ContentGrid(
+              items: favs,
+              autoFocusFirst: false,
+            ),
     );
   }
 }

@@ -1,4 +1,4 @@
-import 'package:flutter/material.dart';
+﻿import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart';
 import '../theme/app_theme.dart';
@@ -6,20 +6,24 @@ import 'home_screen.dart';
 import 'search_screen.dart';
 import 'live_tv_screen.dart';
 import 'movies_screen.dart';
-import 'series_screen.dart';
+
 import 'favorites_screen.dart';
 import 'settings_screen.dart';
 import 'more_screen.dart';
 
-// TV remote D-pad / Enter key codes
-const _kDpadCenter = LogicalKeyboardKey.select;
-const _kEnter = LogicalKeyboardKey.enter;
-const _kDpadUp = LogicalKeyboardKey.arrowUp;
-const _kDpadDown = LogicalKeyboardKey.arrowDown;
-const _kDpadLeft = LogicalKeyboardKey.arrowLeft;
-const _kDpadRight = LogicalKeyboardKey.arrowRight;
-const _kBack = LogicalKeyboardKey.goBack;
-const _kEscape = LogicalKeyboardKey.escape;
+// TV remote D-pad / Enter / Media key codes
+const _kDpadCenter  = LogicalKeyboardKey.select;
+const _kEnter       = LogicalKeyboardKey.enter;
+const _kDpadUp      = LogicalKeyboardKey.arrowUp;
+const _kDpadDown    = LogicalKeyboardKey.arrowDown;
+const _kDpadLeft    = LogicalKeyboardKey.arrowLeft;
+const _kDpadRight   = LogicalKeyboardKey.arrowRight;
+const _kBack        = LogicalKeyboardKey.goBack;
+const _kEscape      = LogicalKeyboardKey.escape;
+const _kMediaPlay   = LogicalKeyboardKey.mediaPlayPause;
+const _kMediaStop   = LogicalKeyboardKey.mediaStop;
+const _kMediaNext   = LogicalKeyboardKey.mediaTrackNext;
+const _kMediaPrev   = LogicalKeyboardKey.mediaTrackPrevious;
 
 class MainShell extends StatefulWidget {
   const MainShell({super.key});
@@ -33,12 +37,16 @@ class _MainShellState extends State<MainShell> {
   // Whether focus is currently on the sidebar (true) or the content area (false)
   bool _sidebarFocused = true;
 
+  // ── Double-back-press exit ─────────────────────────────────────
+  // Track last time back was pressed; require two presses within 2 seconds.
+  DateTime? _lastBackPress;
+
   // Cached screen-width flag, updated in build() — used by the key handler
-  // so it doesn’t need to call MediaQuery from a non-build context.
+  // so it doesn't need to call MediaQuery from a non-build context.
   bool _isWide = true;
 
   // Focus nodes for the two logical zones
-  final FocusNode _sidebarFocusScope = FocusNode(debugLabel: 'SidebarScope');
+  final FocusScopeNode _sidebarFocusScope = FocusScopeNode(debugLabel: 'SidebarScope');
   // FocusScopeNode (not plain FocusNode) is required for TV: when the scope
   // receives focus it automatically forwards to its first focusable child,
   // enabling D-pad traversal through grids / lists in every content screen.
@@ -54,10 +62,6 @@ class _MainShellState extends State<MainShell> {
     _NavItem(
         icon: Icons.movie_outlined, activeIcon: Icons.movie, label: 'Movies'),
     _NavItem(
-        icon: Icons.video_library_outlined,
-        activeIcon: Icons.video_library,
-        label: 'Series'),
-    _NavItem(
         icon: Icons.favorite_border,
         activeIcon: Icons.favorite,
         label: 'Favorites'),
@@ -71,29 +75,55 @@ class _MainShellState extends State<MainShell> {
         label: 'More'),
   ];
 
-  // Bottom nav visible indices
-  static const _bottomIndices = [0, 1, 2, 3, 7];
+  // Bottom nav visible indices (0=Home,1=Search,2=LiveTV,3=Movies,6=More)
+  static const _bottomIndices = [0, 1, 2, 3, 6];
+
+  late final List<FocusNode> _sidebarFocusNodes;
 
   @override
   void initState() {
     super.initState();
+    _sidebarFocusNodes = List.generate(_navItems.length, (index) => FocusNode(debugLabel: 'SidebarItem_$index'));
     HardwareKeyboard.instance.addHandler(_handleKeyEvent);
-    // Give the sidebar initial focus so the TV remote works from the first
-    // frame — without this, no FocusNode owns focus and remote keys are lost.
+    // TV NAV — give sidebar first focus so remote works from frame 1
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) _sidebarFocusScope.requestFocus();
+      if (mounted) {
+        _sidebarFocused = true; // TV NAV
+        _sidebarFocusNodes[_selectedIndex].requestFocus(); // TV NAV
+      }
     });
   }
 
   @override
   void dispose() {
     HardwareKeyboard.instance.removeHandler(_handleKeyEvent);
+    for (final node in _sidebarFocusNodes) {
+      node.dispose();
+    }
     _sidebarFocusScope.dispose();
     _contentFocusScopeNode.dispose();
     super.dispose();
   }
 
+  bool _isBackKey(LogicalKeyboardKey key) {
+    return key == _kBack ||
+           key == _kEscape ||
+           key == LogicalKeyboardKey.backspace ||
+           key.keyId == 8 ||
+           key.keyId == 27 ||
+           key.keyId == 166 ||
+           key.keyId == 0x1000000a6;
+  }
+
   bool _handleKeyEvent(KeyEvent event) {
+    if (!mounted) return false;
+    try {
+      final route = ModalRoute.of(context);
+      if (route != null && !route.isCurrent) {
+        return false;
+      }
+    } catch (_) {}
+
     if (event is! KeyDownEvent && event is! KeyRepeatEvent) return false;
     final key = event.logicalKey;
 
@@ -101,16 +131,31 @@ class _MainShellState extends State<MainShell> {
       debugPrint('[TV Remote] Key: $key  sidebarFocused=$_sidebarFocused  isWide=$_isWide');
     }
 
-    // Use the cached _isWide flag — safe to read from a key-event callback
-    // (no BuildContext / MediaQuery needed).
     final isWide = _isWide;
 
     try {
+      // Media keys — always let content handle them (player seek/play)
+      if (key == _kMediaPlay || key == _kMediaStop ||
+          key == _kMediaNext  || key == _kMediaPrev || key.keyId == 85) {
+        return false; // pass to focused widget (DetailScreen player)
+      }
+
       // Handle back/escape to go back to sidebar from content
       if (isWide && !_sidebarFocused) {
-        if (key == _kBack || key == _kEscape) {
+        if (_isBackKey(key)) {
+          // If we are in a text field (typing search query) and backspace is pressed,
+          // let the text field handle the deletion instead of navigating to sidebar.
+          final primaryFocus = FocusManager.instance.primaryFocus;
+          final context = primaryFocus?.context;
+          final isTextField = context != null &&
+              (context.findAncestorWidgetOfExactType<EditableText>() != null ||
+               context.findAncestorWidgetOfExactType<TextField>() != null);
+          if (isTextField && (key == LogicalKeyboardKey.backspace || key.keyId == 8)) {
+            return false;
+          }
+
           setState(() => _sidebarFocused = true);
-          _sidebarFocusScope.requestFocus();
+          _sidebarFocusNodes[_selectedIndex].requestFocus();
           return true;
         }
       }
@@ -118,41 +163,50 @@ class _MainShellState extends State<MainShell> {
       // On wide (TV/tablet) sidebar layout:
       if (isWide) {
         if (_sidebarFocused) {
-          // Navigate sidebar Up/Down
-          if (key == _kDpadUp) {
-            final next = (_selectedIndex - 1 + _navItems.length) % _navItems.length;
-            setState(() => _selectedIndex = next);
-            return true;
-          }
-          if (key == _kDpadDown) {
-            final next = (_selectedIndex + 1) % _navItems.length;
-            setState(() => _selectedIndex = next);
-            return true;
-          }
           // Enter/OK/Right on sidebar → move focus to content
-          if (key == _kDpadCenter || key == _kEnter || key == _kDpadRight) {
+          if (key == _kDpadCenter || key == _kEnter || key.keyId == 13 || key.keyId == 23 || key.keyId == 96 || key == _kDpadRight || key.keyId == 39) {
             setState(() => _sidebarFocused = false);
             _contentFocusScopeNode.requestFocus();
             return true;
           }
+          return false;
         } else {
-          // In content — Left key returns focus to sidebar
-          if (key == _kDpadLeft) {
-            setState(() => _sidebarFocused = true);
-            _sidebarFocusScope.requestFocus();
-            return true;
+          // TV NAV — Left arrow from content area → return to sidebar
+          if (key == _kDpadLeft || key.keyId == 37) { // TV NAV
+            final primaryFocus = FocusManager.instance.primaryFocus;
+            final isTextField = primaryFocus?.context?.widget is EditableText ||
+                                primaryFocus?.debugLabel?.contains('EditableText') == true;
+
+            if (!isTextField) {
+              final moved = primaryFocus?.focusInDirection(TraversalDirection.left) ?? false;
+              if (!moved) {
+                setState(() => _sidebarFocused = true); // TV NAV
+                _sidebarFocusNodes[_selectedIndex].requestFocus(); // TV NAV
+              }
+              return true; // TV NAV
+            }
+            return false;
           }
-          // All other keys (Up/Down/Right/Enter) — let the content widget handle them
+          // In content area: let spatial focus traversal handle remaining keys
           return false;
         }
       } else {
-        // On narrow (phone/mobile): Left/Right cycle bottom bar items
+        // Narrow (phone/mobile): Left/Right cycle bottom bar
         final pos = _bottomIndices.indexOf(_selectedIndex);
-        if (key == _kDpadLeft && pos > 0) {
+        if ((key == _kDpadLeft || key.keyId == 37) && pos > 0) {
           setState(() => _selectedIndex = _bottomIndices[pos - 1]);
           return true;
         }
-        if (key == _kDpadRight && pos >= 0 && pos < _bottomIndices.length - 1) {
+        if ((key == _kDpadRight || key.keyId == 39) && pos >= 0 && pos < _bottomIndices.length - 1) {
+          setState(() => _selectedIndex = _bottomIndices[pos + 1]);
+          return true;
+        }
+        // Up/Down on narrow — navigate bottom bar items
+        if ((key == _kDpadUp || key.keyId == 38) && pos > 0) {
+          setState(() => _selectedIndex = _bottomIndices[pos - 1]);
+          return true;
+        }
+        if ((key == _kDpadDown || key.keyId == 40) && pos >= 0 && pos < _bottomIndices.length - 1) {
           setState(() => _selectedIndex = _bottomIndices[pos + 1]);
           return true;
         }
@@ -165,15 +219,14 @@ class _MainShellState extends State<MainShell> {
 
   Widget get _currentScreen {
     switch (_selectedIndex) {
-      case 0: return const HomeScreen();
-      case 1: return const SearchScreen();
-      case 2: return const LiveTvScreen();
-      case 3: return const MoviesScreen();
-      case 4: return const SeriesScreen();
-      case 5: return const FavoritesScreen();
-      case 6: return const SettingsScreen();
-      case 7: return const MoreScreen();
-      default: return const HomeScreen();
+      case 0: return HomeScreen(sidebarFocused: _sidebarFocused);
+      case 1: return SearchScreen(sidebarFocused: _sidebarFocused);
+      case 2: return LiveTvScreen(sidebarFocused: _sidebarFocused);
+      case 3: return MoviesScreen(sidebarFocused: _sidebarFocused);
+      case 4: return FavoritesScreen(sidebarFocused: _sidebarFocused);
+      case 5: return SettingsScreen(sidebarFocused: _sidebarFocused);
+      case 6: return const MoreScreen();
+      default: return HomeScreen(sidebarFocused: _sidebarFocused);
     }
   }
 
@@ -194,39 +247,32 @@ class _MainShellState extends State<MainShell> {
           _sidebarFocusScope.requestFocus();
           return;
         }
+
+        // ── Double-back-press guard ─────────────────────────────
+        final now = DateTime.now();
+        final lastPress = _lastBackPress;
+        if (lastPress == null ||
+            now.difference(lastPress) > const Duration(seconds: 2)) {
+          // First press — show hint snackbar, DO NOT exit
+          _lastBackPress = now;
+          if (context.mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Press back again to exit'),
+                duration: Duration(seconds: 2),
+                backgroundColor: Colors.black87,
+              ),
+            );
+          }
+          return;
+        }
+
+        // Second press within 2 s → show exit dialog
+        _lastBackPress = null;
         final shouldExit = await showDialog<bool>(
           context: context,
           barrierDismissible: false,
-          builder: (ctx) => AlertDialog(
-            backgroundColor: AppColors.bg2,
-            shape:
-                RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-            title: const Row(children: [
-              Icon(Icons.exit_to_app, color: AppColors.accent, size: 22),
-              SizedBox(width: 10),
-              Text('Exit App',
-                  style: TextStyle(
-                      color: AppColors.textPrimary,
-                      fontSize: 18,
-                      fontWeight: FontWeight.w600)),
-            ]),
-            content: const Text(
-              'Are you sure you want to exit Smart Care TV?',
-              style: TextStyle(color: AppColors.textSecondary, fontSize: 14),
-            ),
-            actions: [
-              TextButton(
-                autofocus: true,
-                onPressed: () => Navigator.pop(ctx, false),
-                child: const Text('Cancel',
-                    style: TextStyle(color: AppColors.textTertiary)),
-              ),
-              ElevatedButton(
-                onPressed: () => Navigator.pop(ctx, true),
-                child: const Text('OK'),
-              ),
-            ],
-          ),
+          builder: (ctx) => const _ExitDialog(),
         );
         if (shouldExit == true && context.mounted) {
           SystemNavigator.pop();
@@ -242,22 +288,34 @@ class _MainShellState extends State<MainShell> {
   Widget _wideLayout() {
     return Row(
       children: [
-        _SidebarNav(
-          items: _navItems,
-          selectedIndex: _selectedIndex,
-          isFocused: _sidebarFocused,
-          focusNode: _sidebarFocusScope,
-          onTap: (i) {
-            setState(() {
-              _selectedIndex = i;
-              _sidebarFocused = false;
+        FocusScope(
+          node: _sidebarFocusScope,
+          onFocusChange: (value) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted) {
+                final hasFocus = _sidebarFocusScope.hasFocus;
+                if (hasFocus != _sidebarFocused) {
+                  setState(() => _sidebarFocused = hasFocus);
+                }
+              }
             });
-            _contentFocusScopeNode.requestFocus();
           },
-          onNavigateToContent: () {
-            setState(() => _sidebarFocused = false);
-            _contentFocusScopeNode.requestFocus();
-          },
+          child: _SidebarNav(
+            items: _navItems,
+            selectedIndex: _selectedIndex,
+            isFocused: _sidebarFocused,
+            focusNode: _sidebarFocusScope,
+            sidebarFocusNodes: _sidebarFocusNodes,
+            onTap: (i) {
+              setState(() {
+                _selectedIndex = i;
+              });
+            },
+            onNavigateToContent: () {
+              setState(() => _sidebarFocused = false);
+              _contentFocusScopeNode.requestFocus();
+            },
+          ),
         ),
         Expanded(
           // FocusScope forwards focus to the first focusable child in
@@ -292,6 +350,7 @@ class _SidebarNav extends StatelessWidget {
   final int selectedIndex;
   final bool isFocused;
   final FocusNode focusNode;
+  final List<FocusNode> sidebarFocusNodes;
   final ValueChanged<int> onTap;
   final VoidCallback onNavigateToContent;
 
@@ -300,6 +359,7 @@ class _SidebarNav extends StatelessWidget {
     required this.selectedIndex,
     required this.isFocused,
     required this.focusNode,
+    required this.sidebarFocusNodes,
     required this.onTap,
     required this.onNavigateToContent,
   });
@@ -327,58 +387,96 @@ class _SidebarNav extends StatelessWidget {
             final i = e.key;
             final item = e.value;
             final isActive = selectedIndex == i;
-            // Highlight the selected item with extra emphasis when sidebar has focus
-            final isHighlighted = isActive && isFocused;
             return Tooltip(
               message: item.label,
               preferBelow: false,
-              child: InkWell(
-                onTap: () => onTap(i),
-                borderRadius: BorderRadius.circular(10),
-                focusColor: AppColors.accent.withValues(alpha: 0.2),
-                hoverColor: AppColors.bg4,
-                child: AnimatedContainer(
-                  duration: const Duration(milliseconds: 150),
-                  width: 46,
-                  height: 46,
-                  margin: const EdgeInsets.symmetric(vertical: 2),
-                  decoration: BoxDecoration(
-                    color: isActive
-                        ? AppColors.bg4
-                        : Colors.transparent,
-                    borderRadius: BorderRadius.circular(10),
-                    border: isHighlighted
-                        ? Border.all(
-                            color: AppColors.accent.withValues(alpha: 0.8),
-                            width: 2)
-                        : null,
-                  ),
-                  child: Stack(
-                    children: [
-                      Center(
-                        child: Icon(
-                          isActive ? item.activeIcon : item.icon,
-                          color: isActive
-                              ? AppColors.accent
-                              : AppColors.textTertiary,
-                          size: 22,
-                        ),
-                      ),
-                      if (isActive)
-                        Positioned(
-                          left: 0,
-                          top: 10,
-                          bottom: 10,
-                          child: Container(
-                            width: 3,
-                            decoration: BoxDecoration(
-                              color: AppColors.accent,
-                              borderRadius: BorderRadius.circular(2),
-                            ),
+              child: Focus(
+                focusNode: sidebarFocusNodes[i],
+                onFocusChange: (focused) {
+                  // TV NAV — only change screen when this item gains *primary* focus
+                  // (i.e. actual D-pad arrival), not on ancestor scope focus events.
+                  if (focused) {
+                    // Use a microtask so the focus tree settles before calling onTap
+                    Future.microtask(() => onTap(i)); // TV NAV
+                  }
+                },
+                onKeyEvent: (node, event) {
+                  if (event is! KeyDownEvent) return KeyEventResult.ignored;
+                  final key = event.logicalKey;
+                  if (key == LogicalKeyboardKey.select ||
+                      key == LogicalKeyboardKey.enter ||
+                      key == LogicalKeyboardKey.gameButtonA ||
+                      key.keyId == 13 ||
+                      key.keyId == 23 ||
+                      key.keyId == 96 ||
+                      key == LogicalKeyboardKey.arrowRight ||
+                      key.keyId == 39) {
+                    onNavigateToContent();
+                    return KeyEventResult.handled;
+                  }
+                  return KeyEventResult.ignored;
+                },
+                child: Builder(
+                  builder: (ctx) {
+                    final hasFocus = Focus.of(ctx).hasFocus;
+                    return InkWell(
+                      onTap: () => onTap(i),
+                      borderRadius: BorderRadius.circular(10),
+                      focusColor: AppColors.accent.withValues(alpha: 0.2),
+                      hoverColor: AppColors.bg4,
+                      child: AnimatedScale(
+                        scale: hasFocus ? 1.12 : 1.0,
+                        duration: const Duration(milliseconds: 150),
+                        child: AnimatedContainer(
+                          duration: const Duration(milliseconds: 150),
+                          width: 46,
+                          height: 46,
+                          margin: const EdgeInsets.symmetric(vertical: 2),
+                          decoration: BoxDecoration(
+                            color: hasFocus
+                                ? AppColors.accent.withValues(alpha: 0.25)
+                                : (isActive ? AppColors.bg4 : Colors.transparent),
+                            borderRadius: BorderRadius.circular(10),
+                            border: hasFocus
+                                ? Border.all(
+                                    color: AppColors.accent,
+                                    width: 2.5)
+                                : (isActive
+                                    ? Border.all(
+                                        color: AppColors.accent.withValues(alpha: 0.4),
+                                        width: 1.5)
+                                    : null),
+                          ),
+                          child: Stack(
+                            children: [
+                              Center(
+                                child: Icon(
+                                  isActive ? item.activeIcon : item.icon,
+                                  color: (isActive || hasFocus)
+                                      ? AppColors.accent
+                                      : AppColors.textTertiary,
+                                  size: 22,
+                                ),
+                              ),
+                              if (isActive)
+                                Positioned(
+                                  left: 0,
+                                  top: 10,
+                                  bottom: 10,
+                                  child: Container(
+                                    width: 3,
+                                    decoration: BoxDecoration(
+                                      color: AppColors.accent,
+                                      borderRadius: BorderRadius.circular(2),
+                                    ),
+                                  ),
+                                ),
+                            ],
                           ),
                         ),
-                    ],
-                  ),
+                      ),
+                    );
+                  }
                 ),
               ),
             );
@@ -402,7 +500,7 @@ class _BottomNav extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const bottomIndices = [0, 1, 2, 3, 7];
+    const bottomIndices = [0, 1, 2, 3, 6];
     final visibleItems = bottomIndices
         .where((i) => i < items.length)
         .map((i) => _BottomNavEntry(item: items[i], realIndex: i))
@@ -508,4 +606,240 @@ class _BottomNavEntry {
   final _NavItem item;
   final int realIndex;
   const _BottomNavEntry({required this.item, required this.realIndex});
+}
+
+// ─── Exit Confirmation Dialog ─────────────────────────────────────────────────
+// Custom stateful dialog so we can track which button has focus and apply
+// a solid bright-orange highlight to it while dimming the other button.
+class _ExitDialog extends StatefulWidget {
+  const _ExitDialog();
+  @override
+  State<_ExitDialog> createState() => _ExitDialogState();
+}
+
+class _ExitDialogState extends State<_ExitDialog> {
+  // 0 = Cancel focused, 1 = Exit focused
+  int _focusedBtn = 0;
+  final FocusNode _cancelFocus = FocusNode(debugLabel: 'ExitDlg_Cancel');
+  final FocusNode _exitFocus   = FocusNode(debugLabel: 'ExitDlg_Exit');
+
+  @override
+  void initState() {
+    super.initState();
+    _cancelFocus.addListener(_onFocusChange);
+    _exitFocus.addListener(_onFocusChange);
+    // Default focus: Cancel (safe default so user doesn't accidentally exit)
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _cancelFocus.requestFocus();
+
+      // Fallback delays to guarantee focus grabs during route transitions
+      Future.delayed(const Duration(milliseconds: 100), () {
+        if (mounted && !_cancelFocus.hasFocus && !_exitFocus.hasFocus) {
+          _cancelFocus.requestFocus();
+        }
+      });
+      Future.delayed(const Duration(milliseconds: 300), () {
+        if (mounted && !_cancelFocus.hasFocus && !_exitFocus.hasFocus) {
+          _cancelFocus.requestFocus();
+        }
+      });
+    });
+  }
+
+  void _onFocusChange() {
+    if (!mounted) return;
+    setState(() {
+      if (_exitFocus.hasFocus) {
+        _focusedBtn = 1;
+      } else {
+        _focusedBtn = 0;
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _cancelFocus.removeListener(_onFocusChange);
+    _exitFocus.removeListener(_onFocusChange);
+    _cancelFocus.dispose();
+    _exitFocus.dispose();
+    super.dispose();
+  }
+
+  // Handle D-pad Left/Right to switch focus between the two buttons
+  KeyEventResult _onKey(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) return KeyEventResult.ignored;
+    final k = event.logicalKey;
+
+    // Right arrow or Tab → move to Exit button
+    if (k == LogicalKeyboardKey.arrowRight || k == LogicalKeyboardKey.tab) {
+      _exitFocus.requestFocus();
+      return KeyEventResult.handled;
+    }
+    // Left arrow or Shift+Tab → move to Cancel button
+    if (k == LogicalKeyboardKey.arrowLeft) {
+      _cancelFocus.requestFocus();
+      return KeyEventResult.handled;
+    }
+    // Enter / Select / D-pad Center → activate focused button
+    if (k == LogicalKeyboardKey.select ||
+        k == LogicalKeyboardKey.enter ||
+        k.keyId == 13) {
+      if (_focusedBtn == 1) {
+        Navigator.pop(context, true);  // Exit
+      } else {
+        Navigator.pop(context, false); // Cancel
+      }
+      return KeyEventResult.handled;
+    }
+    // Back / Escape → cancel
+    if (k == LogicalKeyboardKey.goBack ||
+        k == LogicalKeyboardKey.escape ||
+        k.keyId == 0x1000000a6 || k.keyId == 166 || k.keyId == 8) {
+      Navigator.pop(context, false);
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  Widget _buildBtn({
+    required String label,
+    required bool isFocused,
+    required FocusNode focusNode,
+    required VoidCallback onPressed,
+    bool autofocus = false,
+  }) {
+    return Focus(
+      focusNode: focusNode,
+      autofocus: autofocus,
+      onKeyEvent: _onKey,
+      child: GestureDetector(
+        onTap: onPressed,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 12),
+          decoration: BoxDecoration(
+            // Focused button: solid bright orange fill
+            // Unfocused button: dim dark background with subtle border
+            color: isFocused
+                ? AppColors.accent
+                : AppColors.bg.withValues(alpha: 0.6),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: isFocused ? AppColors.accent : Colors.white24,
+              width: isFocused ? 2 : 1,
+            ),
+            boxShadow: isFocused
+                ? [
+                    BoxShadow(
+                      color: AppColors.accent.withValues(alpha: 0.5),
+                      blurRadius: 14,
+                      spreadRadius: 2,
+                    ),
+                  ]
+                : null,
+          ),
+          child: Text(
+            label,
+            style: TextStyle(
+              color: isFocused ? Colors.white : Colors.white38,
+              fontSize: 15,
+              fontWeight: isFocused ? FontWeight.w700 : FontWeight.w400,
+              letterSpacing: 0.3,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FocusScope(
+      autofocus: true,
+      child: Dialog(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        child: Container(
+          width: 360,
+          padding: const EdgeInsets.fromLTRB(28, 28, 28, 24),
+          decoration: BoxDecoration(
+            color: AppColors.bg2,
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(color: Colors.white12, width: 1),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.6),
+                blurRadius: 40,
+                spreadRadius: 8,
+              ),
+            ],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Title row
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: AppColors.accent.withValues(alpha: 0.15),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: const Icon(Icons.exit_to_app,
+                        color: AppColors.accent, size: 22),
+                  ),
+                  const SizedBox(width: 12),
+                  const Text(
+                    'Exit App',
+                    style: TextStyle(
+                      color: AppColors.textPrimary,
+                      fontSize: 18,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                'Are you sure you want to exit Smart Care TV?',
+                style: TextStyle(
+                  color: AppColors.textSecondary,
+                  fontSize: 14,
+                  height: 1.5,
+                ),
+              ),
+              const SizedBox(height: 28),
+              // Buttons row
+              Row(
+                children: [
+                  Expanded(
+                    child: _buildBtn(
+                      label: 'Cancel',
+                      isFocused: _focusedBtn == 0,
+                      focusNode: _cancelFocus,
+                      autofocus: true,
+                      onPressed: () => Navigator.pop(context, false),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: _buildBtn(
+                      label: 'Exit',
+                      isFocused: _focusedBtn == 1,
+                      focusNode: _exitFocus,
+                      onPressed: () => Navigator.pop(context, true),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
