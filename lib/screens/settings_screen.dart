@@ -288,55 +288,108 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _buildHeader('Video Quality', 'Adjust playback quality and decoder settings'),
 
         // ─── Compatibility Warning Banner ──────────────────────────────────
-        Container(
-          margin: const EdgeInsets.only(bottom: 24),
-          padding: const EdgeInsets.all(16),
-          decoration: BoxDecoration(
-            color: const Color(0xFF1A2540),
-            borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: const Color(0xFF3A6FD8), width: 1),
-          ),
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Icon(Icons.info_outline, color: Color(0xFF5B9CF6), size: 20),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+        // Shows a red WARNING when HW accel is ON (most common cause of
+        // scrambled video on client TVs). Shows green confirmation when OFF.
+        if (appState.hardwareAccelEnabled)
+          Container(
+            margin: const EdgeInsets.only(bottom: 16),
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: const Color(0xFF2A1010),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.red.shade700, width: 2),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
                   children: [
-                    const Text(
-                      'TV Compatibility Tip',
+                    Icon(Icons.warning_amber_rounded, color: Colors.red.shade400, size: 20),
+                    const SizedBox(width: 8),
+                    Text(
+                      '⚠  SCRAMBLED VIDEO RISK',
                       style: TextStyle(
                         fontSize: 13,
-                        fontWeight: FontWeight.w700,
-                        color: Color(0xFF5B9CF6),
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      appState.hardwareAccelEnabled
-                          ? 'Hardware Acceleration is ON. If you see scrambled or black video on your TV, turn this OFF. Software decoding works on all TV brands (MI Box, TCL, Fire Stick, etc.).'
-                          : 'Hardware Acceleration is OFF ✓. Software decoding is active — maximum compatibility with all TV brands (MI Box, TCL, Fire Stick, Samsung, Sony, Hisense).',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: appState.hardwareAccelEnabled
-                            ? Colors.orange.shade300
-                            : Colors.green.shade300,
-                        height: 1.5,
+                        fontWeight: FontWeight.w800,
+                        color: Colors.red.shade400,
+                        letterSpacing: 0.5,
                       ),
                     ),
                   ],
                 ),
-              ),
-            ],
+                const SizedBox(height: 8),
+                Text(
+                  'Hardware Acceleration is ON. This causes green/scrambled video on many TV brands '
+                  '(Amlogic, Rockchip, MTK, Mali GPU). Turn it OFF for maximum compatibility.',
+                  style: TextStyle(fontSize: 12, color: Colors.red.shade200, height: 1.5),
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: TvFocusable(
+                    onActivate: () {
+                      context.read<AppState>().setHardwareAccel(false);
+                      context.read<AppState>().setBufferSize('medium');
+                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                        content: Text('✅ Reset to safe defaults — software decoding active'),
+                        backgroundColor: Color(0xFF1B5E20),
+                        duration: Duration(seconds: 3),
+                      ));
+                    },
+                    borderRadius: 8,
+                    child: ElevatedButton.icon(
+                      onPressed: () {
+                        context.read<AppState>().setHardwareAccel(false);
+                        context.read<AppState>().setBufferSize('medium');
+                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                          content: Text('✅ Reset to safe defaults — software decoding active'),
+                          backgroundColor: Color(0xFF1B5E20),
+                          duration: Duration(seconds: 3),
+                        ));
+                      },
+                      icon: const Icon(Icons.shield_outlined, size: 18),
+                      label: const Text('Reset to Safe Defaults'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.red.shade800,
+                        foregroundColor: Colors.white,
+                        padding: const EdgeInsets.symmetric(vertical: 12),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        textStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          )
+        else
+          Container(
+            margin: const EdgeInsets.only(bottom: 16),
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: const Color(0xFF0A1F10),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Colors.green.shade800, width: 1),
+            ),
+            child: Row(
+              children: [
+                Icon(Icons.check_circle_outline, color: Colors.green.shade400, size: 20),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    'Software decoding active ✓ — Maximum compatibility with all TV brands '
+                    '(MI Box, TCL, Samsung, Sony, Hisense, Fire Stick, generic Android boxes).',
+                    style: TextStyle(fontSize: 12, color: Colors.green.shade300, height: 1.5),
+                  ),
+                ),
+              ],
+            ),
           ),
-        ),
 
         // ─── Hardware Acceleration ─────────────────────────────────────────
         _buildSwitchRow(
           title: 'Hardware Acceleration',
-          subtitle: 'OFF = Software decode (recommended for all TVs)\nON = Hardware decode (may cause scrambled video on some devices)',
+          subtitle: 'OFF = Software decode (recommended for ALL TVs)\nON = Hardware decode (may cause scrambled/green video on Amlogic, Rockchip, MTK, Mali GPU boxes)',
           value: appState.hardwareAccelEnabled,
           onChanged: (v) => context.read<AppState>().setHardwareAccel(v),
         ),
@@ -554,7 +607,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
         _buildActionRow(
           title: 'App Version',
-          subtitle: 'Smart Care TV v2.2.0',
+          subtitle: 'Smart Care TV v2.5.1',
         ),
         _buildActionRow(
           title: 'Clear Cache',
@@ -671,7 +724,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
             const SizedBox(height: 8),
             const Text(
-              'Version 2.2.0',
+              'Version 2.5.1',
               style: TextStyle(
                 fontSize: 14,
                 color: AppColors.textSecondary,

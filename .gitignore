@@ -43,3 +43,7 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Custom exclusions
+*.apk
+analyze_output_utf8.txt

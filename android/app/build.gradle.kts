@@ -24,7 +24,7 @@ android {
         minSdk = flutter.minSdkVersion
         targetSdk = 35
         versionCode = flutter.versionCode
-        versionName = flutter.versionName
+        versionName = "2.5.1"
         // Disable split APKs so a single universal APK works on ALL chipsets
         // (ARM64-v8a, ARMv7, x86) without needing ABI-specific bundles.
         // Critical for sideloading onto Chinese TV boxes and generic Android TVs.

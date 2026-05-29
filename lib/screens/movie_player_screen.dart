@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -292,7 +292,7 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
       );
       // Apply VOD-optimised mpv properties for universal compatibility.
       // Covers ALL Android TV chipsets: Amlogic S905/S912/S922X, MTK MT5816/MT8695,
-      // Qualcomm, Rockchip RK3328/RK3399, Nvidia Tegra X1, Samsung Exynos.
+      // Qualcomm, Rockchip RK3328/RK3399, Nvidia Tegra X1, Samsung Exynos, Mali GPU.
       final platform = player.platform;
       if (platform is NativePlayer) {
         // -- Caching & buffering --
@@ -301,6 +301,8 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
         await platform.setProperty('demuxer-readahead-secs', '30'); // pre-read 30s ahead
         await platform.setProperty('demuxer-max-bytes', '$bufBytes');
         await platform.setProperty('demuxer-max-back-bytes', '${bufBytes ~/ 4}');
+        // Non-blocking demuxer thread — prevents UI stall on slow SoCs (Rockchip, MTK)
+        await platform.setProperty('demuxer-thread', 'yes');
         // -- Network & reconnect --
         await platform.setProperty('network-timeout', '15');
         await platform.setProperty('reconnect-streamed', 'yes');
@@ -314,17 +316,34 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
         await platform.setProperty('force-seekable', 'yes');
         await platform.setProperty('hr-seek', 'yes');
         // -- Codec / decoding --
-        // hwdec=no forces SW decoding. HW decoding causes green/scrambled video
-        // on Amlogic S905 boxes. User can enable HW accel in Settings if their TV supports it.
+        // hwdec=no forces SW decoding — universally safe on ALL TV chipsets.
+        // HW decoding causes green/scrambled video on Amlogic S905, Rockchip RK3228,
+        // MTK MT5816, generic Mali GPU boxes. User can enable in Settings if needed.
         await platform.setProperty('hwdec', hwAccel ? 'auto-safe' : 'no');
-        await platform.setProperty('vd-lavc-threads', '2');
+        // Auto thread count — let libmpv pick based on available CPU cores.
+        // Hardcoded threads=2 caused scrambling on single/odd-core SoCs.
+        await platform.setProperty('vd-lavc-threads', '0');
         await platform.setProperty('vd-lavc-skiploopfilter', 'nonref');
+        // Auto SW fallback if HW decode fails mid-stream (prevents freeze/scramble)
+        await platform.setProperty('vd-lavc-software-fallback', 'yes');
         await platform.setProperty('framedrop', 'decoder+vo');
-        // -- Video output --
+        // -- Video output & sync --
         await platform.setProperty('gpu-api', 'opengl');
+        // EGL/GLES2 fallback — required on old Mali (T628/T760), Vivante GC7000,
+        // and any box where desktop OpenGL is unavailable (most Chinese TV boxes).
+        await platform.setProperty('opengl-es', '2');
+        // Mali GPU frame-flush — prevents tearing/corruption on Mali T-series GPUs
+        // (common in generic Amlogic, Rockchip, and Samsung SoC-based boxes).
+        await platform.setProperty('opengl-glfinish', 'yes');
+        // Anchor A/V sync to audio clock — eliminates frame scrambling caused by
+        // separate audio/video clock domains on cheaper TV SoCs.
+        await platform.setProperty('video-sync', 'audio');
         // -- Audio --
         await platform.setProperty('audio-stream-silence', 'yes');
-        await platform.setProperty('audio-spdif', 'ac3,eac3,dts');
+        // IMPORTANT: Do NOT use audio-spdif (HDMI passthrough) — it breaks A/V sync
+        // on TVs whose HDMI receiver doesn't support AC3/EAC3 passthrough.
+        // Software audio decoding (default) works on ALL devices.
+        await platform.setProperty('audio-spdif', '');
         // -- Misc --
         await platform.setProperty('ytdl', 'no');
         await platform.setProperty('demuxer-lavf-analyzeduration', '2');

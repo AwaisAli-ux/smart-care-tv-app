@@ -9,7 +9,7 @@ publish_to: 'none'
 
 # App version: shown in Settings screen and app stores
 # Format: major.minor.patch+buildNumber
-version: 1.0.0+1
+version: 2.5.1+2
 
 # ─── SDK Constraints ──────────────────────────────────────────────────────────
 environment:
