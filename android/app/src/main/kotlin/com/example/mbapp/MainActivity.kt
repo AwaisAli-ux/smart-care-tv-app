@@ -1,22 +1,27 @@
 package com.example.mbapp
 
+import android.app.ActivityManager
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.MediaCodecList
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.view.Display
 import android.view.KeyEvent
+import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
 
-    private val CHANNEL = "com.example.mbapp/audio"
+    private val CHANNEL             = "com.example.mbapp/audio"
+    private val DEVICE_INFO_CHANNEL  = "com.example.mbapp/device_info"
     private var audioManager: AudioManager? = null
     private var focusRequest: AudioFocusRequest? = null
     private val handler = Handler(Looper.getMainLooper())
@@ -126,6 +131,110 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+
+        // ── Device Info Channel ───────────────────────────────────────────────────
+        // Used by DeviceProfileService to read hardware capabilities at startup.
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DEVICE_INFO_CHANNEL)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "getDeviceInfo" -> {
+                        try {
+                            result.success(getDeviceInfo())
+                        } catch (e: Exception) {
+                            result.error("DEVICE_INFO_ERROR", e.message, null)
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+    }
+
+    // ── Device Info Helpers ───────────────────────────────────────────────────────
+
+    /** Returns a map of all hardware capabilities needed by DeviceProfileService. */
+    private fun getDeviceInfo(): Map<String, Any> {
+        val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val mi = ActivityManager.MemoryInfo()
+        am.getMemoryInfo(mi)
+        val totalRamMb = (mi.totalMem / 1048576L).toInt()
+
+        return mapOf(
+            "brand"           to Build.BRAND.lowercase(),
+            "manufacturer"    to Build.MANUFACTURER.lowercase(),
+            "model"           to Build.MODEL,
+            "device"          to Build.DEVICE,
+            "osVersion"       to Build.VERSION.RELEASE,
+            "sdkInt"          to Build.VERSION.SDK_INT,
+            "totalRamMb"      to totalRamMb,
+            "supportsHevc"    to hasCodec("video/hevc"),
+            "supportsHdr"     to supportsHdr(),
+            "supportsAv1"     to hasCodec("video/av01"),
+            "supportsVp9"     to hasCodec("video/x-vnd.on2.vp9"),
+            "supportsH264"    to hasCodec("video/avc"),
+            "supportsAac"     to hasCodec("audio/mp4a-latm"),
+            "supportsAc3"     to hasCodec("audio/ac3"),
+            "supportsEac3"    to hasCodec("audio/eac3"),
+            "supportedVideoCodecs" to getSupportedVideoCodecs()
+        )
+    }
+
+    /** Returns true if the device has a hardware or software decoder for [mimeType]. */
+    private fun hasCodec(mimeType: String): Boolean {
+        return try {
+            val list = MediaCodecList(MediaCodecList.ALL_CODECS)
+            list.codecInfos.any { info ->
+                !info.isEncoder && info.supportedTypes.any {
+                    it.equals(mimeType, ignoreCase = true)
+                }
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /** Returns the list of unique decoder MIME types supported by this device. */
+    private fun getSupportedVideoCodecs(): List<String> {
+        return try {
+            val list = MediaCodecList(MediaCodecList.ALL_CODECS)
+            list.codecInfos
+                .filter { !it.isEncoder }
+                .flatMap { it.supportedTypes.toList() }
+                .filter { it.startsWith("video/") }
+                .distinct()
+                .sorted()
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    /**
+     * Detects HDR support.
+     * API 26+: checks Display.HdrCapabilities.
+     * API 24-25: checks FEATURE_HDR_VIDEO system feature.
+     * Below API 24: returns false (no HDR API available).
+     */
+    private fun supportsHdr(): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                val display: Display = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    display ?: wm.defaultDisplay
+                } else {
+                    @Suppress("DEPRECATION")
+                    wm.defaultDisplay
+                }
+                @Suppress("DEPRECATION")
+                val hdrTypes = display.hdrCapabilities?.supportedHdrTypes ?: intArrayOf()
+                hdrTypes.isNotEmpty()
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_HIFI_SENSORS) ||
+                packageManager.hasSystemFeature("android.hardware.hdr_display")
+            } else {
+                false
+            }
+        } catch (e: Exception) {
+            false
+        }
     }
 
     /**

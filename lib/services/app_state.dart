@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/content_model.dart';
 import 'iptv_service.dart';
+import 'device_profile_service.dart';
 
 /// These brand keywords define "featured" channels.
 /// Each brand gets ONE representative at the front, interleaved randomly.
@@ -64,6 +65,16 @@ class AppState extends ChangeNotifier {
   String _bufferSize = 'medium'; // 'small' | 'medium' | 'large'
   String _selectedQuality = 'Auto (Recommended)';
 
+  // ── Device Profile ───────────────────────────────────────────────────────
+  DeviceProfile? _deviceProfile;
+  DeviceProfile? get deviceProfile => _deviceProfile;
+
+  void setDeviceProfile(DeviceProfile profile) {
+    _deviceProfile = profile;
+    notifyListeners();
+    debugPrint('[AppState] DeviceProfile set: $profile');
+  }
+
   // ── Getters ─────────────────────────────────────────────────────────────
   bool get isLoggedIn => _isLoggedIn;
   String get username => _username;
@@ -91,8 +102,25 @@ class AppState extends ChangeNotifier {
   String get bufferSize => _bufferSize;
   String get selectedQuality => _selectedQuality;
 
+  /// Active quality tier — derived from the Settings quality selection string.
+  QualityTier get qualityTier =>
+      DeviceProfileService.qualityTierFromSetting(_selectedQuality);
+
   /// Returns buffer size in bytes for use in PlayerConfiguration.
+  /// If a DeviceProfile is available and the device has insufficient RAM for
+  /// the user-selected buffer size, the RAM-safe value takes priority.
   int get bufferBytes {
+    // Static value from user's Settings selection
+    final userBytes = _staticBufferBytes;
+    // RAM-safe value from detected hardware
+    final deviceBytes = _deviceProfile?.optimalBufferBytes;
+    // Use the smaller of the two — protect low-RAM devices from OOM
+    if (deviceBytes != null && deviceBytes < userBytes) return deviceBytes;
+    return userBytes;
+  }
+
+  /// User-selected buffer bytes (ignoring RAM constraints).
+  int get _staticBufferBytes {
     switch (_bufferSize) {
       case 'small':  return 32  * 1024 * 1024;  // 32 MB
       case 'large':  return 128 * 1024 * 1024;  // 128 MB

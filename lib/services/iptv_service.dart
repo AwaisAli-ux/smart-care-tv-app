@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import '../models/content_model.dart';
+import 'device_profile_service.dart';
 
 // ── Top-level helpers for compute() (must be top-level) ──────────────────
 List<dynamic> _parseJsonList(String body) {
@@ -471,6 +472,92 @@ class IptvService {
       ...exts.map((e) => getMovieStreamUrl(username, password, streamId, e)),
       '$baseUrl/movie/$username/$password/$streamId', // bare fallback
     ];
+  }
+
+  // ── Quality-Tier URL Builders ────────────────────────────────────────────────
+
+  /// Returns live stream URL candidates ordered for [tier].
+  ///
+  /// Tier mapping:
+  ///  • auto / 4K / 1080p  → same as getLiveStreamUrlCandidates() (server auto-picks)
+  ///  • 720p HD             → prioritise .m3u8 with q=720 hint
+  ///  • 480p SD             → .m3u8 with q=480, then ts
+  ///  • low360 (failover)   → lowest quality variants only
+  static List<String> getLiveStreamUrlCandidatesByQuality(
+      String username, String password, String streamId, QualityTier tier) {
+    // All Xtream servers handle quality via adaptive HLS; we send quality hints
+    // as URL parameters — servers that support them will honour them, others ignore.
+    switch (tier) {
+      case QualityTier.uhd4k:
+      case QualityTier.fhd1080:
+      case QualityTier.auto:
+        // Full-quality candidate list (same as before)
+        return getLiveStreamUrlCandidates(username, password, streamId);
+
+      case QualityTier.hd720:
+        return [
+          '$baseUrl/live/$username/$password/$streamId.m3u8?quality=720p',
+          '$baseUrl/live/$username/$password/$streamId.m3u8',   // fallback
+          '$baseUrl/live/$username/$password/$streamId.ts',
+          '$baseUrl/live/$username/$password/$streamId',
+        ];
+
+      case QualityTier.sd480:
+        return [
+          '$baseUrl/live/$username/$password/$streamId.m3u8?quality=480p',
+          '$baseUrl/live/$username/$password/$streamId.m3u8?quality=sd',
+          '$baseUrl/live/$username/$password/$streamId.m3u8',
+          '$baseUrl/live/$username/$password/$streamId.ts',
+          '$baseUrl/live/$username/$password/$streamId',
+        ];
+
+      case QualityTier.low360:
+        // Level-3 failover — lowest possible quality
+        return [
+          '$baseUrl/live/$username/$password/$streamId.m3u8?quality=360p',
+          '$baseUrl/live/$username/$password/$streamId.m3u8?quality=low',
+          '$baseUrl/live/$username/$password/${streamId}_low.m3u8',
+          '$baseUrl/live/$username/$password/$streamId.ts',
+          '$baseUrl/live/$username/$password/$streamId',
+        ];
+    }
+  }
+
+  /// Returns movie URL candidates ordered for [tier].
+  static List<String> getMovieStreamUrlCandidatesByQuality(
+      String username, String password, String streamId, QualityTier tier,
+      [String declaredExt = 'mp4']) {
+    final ext = declaredExt.toLowerCase().isEmpty ? 'mp4' : declaredExt.toLowerCase();
+    switch (tier) {
+      case QualityTier.uhd4k:
+      case QualityTier.fhd1080:
+      case QualityTier.auto:
+        return getMovieStreamUrlCandidates(username, password, streamId, ext);
+
+      case QualityTier.hd720:
+        return [
+          '$baseUrl/movie/$username/$password/$streamId.mp4?quality=720p',
+          getMovieStreamUrl(username, password, streamId, ext),
+          getMovieStreamUrl(username, password, streamId, 'mp4'),
+          '$baseUrl/movie/$username/$password/$streamId',
+        ];
+
+      case QualityTier.sd480:
+        return [
+          '$baseUrl/movie/$username/$password/$streamId.mp4?quality=480p',
+          '$baseUrl/movie/$username/$password/$streamId.mp4?quality=sd',
+          getMovieStreamUrl(username, password, streamId, 'mp4'),
+          '$baseUrl/movie/$username/$password/$streamId',
+        ];
+
+      case QualityTier.low360:
+        return [
+          '$baseUrl/movie/$username/$password/$streamId.mp4?quality=360p',
+          '$baseUrl/movie/$username/$password/$streamId.mp4?quality=low',
+          getMovieStreamUrl(username, password, streamId, 'mp4'),
+          '$baseUrl/movie/$username/$password/$streamId',
+        ];
+    }
   }
 
   static String getSeriesStreamUrl(

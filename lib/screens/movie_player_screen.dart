@@ -9,6 +9,7 @@ import '../models/content_model.dart';
 import '../theme/app_theme.dart';
 import '../services/app_state.dart';
 import '../services/iptv_service.dart';
+import '../services/device_profile_service.dart';
 
 const _movieAudioCh = MethodChannel('com.example.mbapp/audio');
 
@@ -69,19 +70,16 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
   /// Single root focus node — handles ALL remote key events
   final FocusNode _focus = FocusNode(debugLabel: 'MoviePlayer');
 
-  static const _ua =
-      'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 '
-      '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
+  // Failover level: 0 = full quality, 1 = one tier lower, 2 = lowest (360p)
+  int _failoverLevel = 0;
 
-  /// All HTTP headers sent with every stream open() call.
-  static Map<String, String> get _streamHeaders => {
-    'User-Agent': _ua,
-    'Accept': '*/*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Connection': 'keep-alive',
-    'Referer': '${IptvService.baseUrl}/',
-    'Origin': IptvService.baseUrl,
-  };
+  // Device profile — resolved once at initState
+  DeviceProfile? _deviceProfile;
+  DeviceProfile get _profile =>
+      _deviceProfile ?? DeviceProfileService.instance.currentProfile;
+
+  // Device-specific stream headers (UA varies by brand)
+  Map<String, String> get _streamHeaders => _profile.streamHeaders;
 
   @override
   void initState() {
@@ -95,6 +93,8 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
     ]);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
+        // Cache device profile once so we don't read context inside async gaps
+        _deviceProfile = context.read<AppState>().deviceProfile;
         _focus.requestFocus();
         _startPlay();
       }
@@ -192,9 +192,7 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
 
   // ── Playback ─────────────────────────────────────────────────────────────────
 
-  /// Build candidate URLs for the movie — declared extension first, then the
-  /// 3 most universally supported fallbacks, then bare URL (server redirect).
-  /// Kept to 5 URLs max so the worst-case probe time stays under 60s.
+  /// Build quality-tier-aware URL candidates for this movie.
   List<String> _movieUrls() {
     final s = context.read<AppState>();
     final u = s.username;
@@ -202,20 +200,24 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
     final id = _currentItem.id;
     final declaredExt =
         (_currentItem.containerExtension ?? 'mp4').toLowerCase();
-    // Declared ext first, then the most universally supported fallbacks.
-    // Deliberately exclude ts/avi/m3u8 from the default VOD list — they
-    // are rarely the correct container for server-side VOD streams and
-    // add unnecessary probe time.
-    final exts = <String>[declaredExt];
-    for (final e in ['mp4', 'mkv']) {
-      if (!exts.contains(e)) exts.add(e);
+    final tier = _failoverTier(s.qualityTier);
+    return IptvService.getMovieStreamUrlCandidatesByQuality(u, p, id, tier, declaredExt);
+  }
+
+  /// Returns the actual tier to use, degraded by failover level.
+  QualityTier _failoverTier(QualityTier base) {
+    if (_failoverLevel == 0) return base;
+    if (_failoverLevel == 1) {
+      switch (base) {
+        case QualityTier.uhd4k:   return QualityTier.fhd1080;
+        case QualityTier.fhd1080: return QualityTier.hd720;
+        case QualityTier.hd720:   return QualityTier.sd480;
+        case QualityTier.sd480:
+        case QualityTier.low360:
+        case QualityTier.auto:    return QualityTier.sd480;
+      }
     }
-    return [
-      // Extension-based URLs (most Xtream servers)
-      ...exts.map((e) => IptvService.getMovieStreamUrl(u, p, id, e)),
-      // Bare URL without extension — some servers serve via redirect
-      '${IptvService.baseUrl}/movie/$u/$p/$id',
-    ];
+    return QualityTier.low360;
   }
 
   /// Returns true if the error string is a non-fatal libmpv warning
@@ -255,11 +257,14 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
     if (!mounted) return;
 
     // Read player settings BEFORE any await — safe synchronous context access.
-    // CRITICAL: hardware accel defaults to OFF — software decoding is
-    // universally compatible across all TV chipsets (Amlogic, MediaTek,
-    // Qualcomm, Tegra). Hardware decoding causes scrambled video on many boxes.
-    final hwAccel = context.read<AppState>().hardwareAccelEnabled;
-    final bufBytes = context.read<AppState>().bufferBytes;
+    final appState   = context.read<AppState>();
+    final hwAccel    = appState.hardwareAccelEnabled;
+    final bufBytes   = appState.bufferBytes;   // RAM-aware
+    final profile    = _profile;
+
+    debugPrint('[Movie] ▶ ${_currentItem.title} | device=${profile.deviceClass} '
+        'hevc=${profile.supportsHevc} hdr=${profile.supportsHdr} '
+        'buf=${bufBytes ~/ (1024 * 1024)}MB failoverLevel=$_failoverLevel');
 
     setState(() {
       _loading      = true;
@@ -281,8 +286,6 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
     try {
       await _requestAudio();
       final urls = _movieUrls();
-      debugPrint('▶ [Movie] Trying ${urls.length} URLs for ${_currentItem.title}');
-      debugPrint('▶ [Movie] hwAccel=$hwAccel bufferBytes=${bufBytes ~/ (1024 * 1024)}MB');
 
       final player = Player(
         configuration: PlayerConfiguration(
@@ -290,61 +293,77 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
           logLevel: MPVLogLevel.warn,
         ),
       );
-      // Apply VOD-optimised mpv properties for universal compatibility.
-      // Covers ALL Android TV chipsets: Amlogic S905/S912/S922X, MTK MT5816/MT8695,
-      // Qualcomm, Rockchip RK3328/RK3399, Nvidia Tegra X1, Samsung Exynos, Mali GPU.
+
+      // Universal mpv configuration — same brand coverage as channel player.
       final platform = player.platform;
       if (platform is NativePlayer) {
-        // -- Caching & buffering --
+        // ── Caching & buffering ──
         await platform.setProperty('cache', 'yes');
-        await platform.setProperty('cache-secs', '60');             // keep 60s of VOD in cache
-        await platform.setProperty('demuxer-readahead-secs', '30'); // pre-read 30s ahead
+        await platform.setProperty('cache-secs', '60');             // 60s for VOD
+        await platform.setProperty('demuxer-readahead-secs', '30');
         await platform.setProperty('demuxer-max-bytes', '$bufBytes');
         await platform.setProperty('demuxer-max-back-bytes', '${bufBytes ~/ 4}');
-        // Non-blocking demuxer thread — prevents UI stall on slow SoCs (Rockchip, MTK)
         await platform.setProperty('demuxer-thread', 'yes');
-        // -- Network & reconnect --
+
+        // ── Network & reconnect ──
         await platform.setProperty('network-timeout', '15');
         await platform.setProperty('reconnect-streamed', 'yes');
         await platform.setProperty('reconnect-max-retries', '5');
         await platform.setProperty('reconnect-delay-max', '4');
         await platform.setProperty('stream-lavf-o',
             'reconnect=1,reconnect_streamed=1,reconnect_delay_max=4');
-        await platform.setProperty('http-header-fields',
-            'User-Agent: $_ua\nReferer: ${IptvService.baseUrl}/\nOrigin: ${IptvService.baseUrl}\nAccept: */*\nConnection: keep-alive');
-        // -- Seeking (VOD) --
+
+        // ── AES-128 HLS & encrypted stream support ──
+        await platform.setProperty('demuxer-lavf-o',
+            'allowed_extensions=ALL,'
+            'protocol_whitelist=file,http,https,tcp,tls,crypto,data,ftp');
+        await platform.setProperty('tls-verify', 'no');
+        await platform.setProperty('tls-min-version', '1.0');
+
+        // ── Seeking (VOD) ──
         await platform.setProperty('force-seekable', 'yes');
         await platform.setProperty('hr-seek', 'yes');
-        // -- Codec / decoding --
-        // hwdec=no forces SW decoding — universally safe on ALL TV chipsets.
-        // HW decoding causes green/scrambled video on Amlogic S905, Rockchip RK3228,
-        // MTK MT5816, generic Mali GPU boxes. User can enable in Settings if needed.
+
+        // ── Device-specific HTTP headers ──
+        final ua      = profile.userAgent;
+        const referer = '${IptvService.baseUrl}/';
+        const origin  = IptvService.baseUrl;
+        await platform.setProperty('http-header-fields',
+            'User-Agent: $ua\nReferer: $referer\nOrigin: $origin\nAccept: */*\nConnection: keep-alive');
+
+        // ── Codec / decoding ──
         await platform.setProperty('hwdec', hwAccel ? 'auto-safe' : 'no');
-        // Auto thread count — let libmpv pick based on available CPU cores.
-        // Hardcoded threads=2 caused scrambling on single/odd-core SoCs.
         await platform.setProperty('vd-lavc-threads', '0');
         await platform.setProperty('vd-lavc-skiploopfilter', 'nonref');
-        // Auto SW fallback if HW decode fails mid-stream (prevents freeze/scramble)
         await platform.setProperty('vd-lavc-software-fallback', 'yes');
         await platform.setProperty('framedrop', 'decoder+vo');
-        // -- Video output & sync --
+
+        // ── H.264 force for HEVC-unsupported devices ──
+        if (profile.forceH264) {
+          await platform.setProperty('vd-lavc-vcodec', 'h264');
+          debugPrint('[Movie] H.264 forced (no HEVC decoder)');
+        }
+
+        // ── HDR disable on SDR-only displays ──
+        if (profile.disableHdr) {
+          await platform.setProperty('tone-mapping', 'clip');
+          await platform.setProperty('hdr-compute-peak', 'no');
+          debugPrint('[Movie] HDR tone-mapping disabled (SDR display)');
+        }
+
+        // ── Video output & sync ──
         await platform.setProperty('gpu-api', 'opengl');
-        // EGL/GLES2 fallback — required on old Mali (T628/T760), Vivante GC7000,
-        // and any box where desktop OpenGL is unavailable (most Chinese TV boxes).
         await platform.setProperty('opengl-es', '2');
-        // Mali GPU frame-flush — prevents tearing/corruption on Mali T-series GPUs
-        // (common in generic Amlogic, Rockchip, and Samsung SoC-based boxes).
         await platform.setProperty('opengl-glfinish', 'yes');
-        // Anchor A/V sync to audio clock — eliminates frame scrambling caused by
-        // separate audio/video clock domains on cheaper TV SoCs.
         await platform.setProperty('video-sync', 'audio');
-        // -- Audio --
+        await platform.setProperty('video-latency-hacks',
+            profile.enableLatencyHacks ? 'yes' : 'no');
+
+        // ── Audio ──
         await platform.setProperty('audio-stream-silence', 'yes');
-        // IMPORTANT: Do NOT use audio-spdif (HDMI passthrough) — it breaks A/V sync
-        // on TVs whose HDMI receiver doesn't support AC3/EAC3 passthrough.
-        // Software audio decoding (default) works on ALL devices.
         await platform.setProperty('audio-spdif', '');
-        // -- Misc --
+
+        // ── Misc ──
         await platform.setProperty('ytdl', 'no');
         await platform.setProperty('demuxer-lavf-analyzeduration', '2');
         await platform.setProperty('demuxer-lavf-probesize', '1048576');
@@ -394,36 +413,36 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
           // This fixes streams that start playing before sending a duration,
           // and streams that send duration before the first video frame.
           final successCompleter = Completer<void>();
-          bool _gotDuration = false;
-          bool _gotWidth    = false;
-          bool _gotPlaying  = false;
-          bool _hasBuffered = false;
+          bool gotDuration = false;
+          bool gotWidth    = false;
+          bool gotPlaying  = false;
+          bool hasBuffered = false;
 
-          void _checkSuccess() {
+          void checkSuccess() {
             if (successCompleter.isCompleted) return;
             // Gate 1: playing alone is enough — decoder confirmed active
-            if (_gotPlaying) { successCompleter.complete(); return; }
+            if (gotPlaying) { successCompleter.complete(); return; }
             // Gate 2: video frame seen
-            if (_gotWidth)   { successCompleter.complete(); return; }
+            if (gotWidth)   { successCompleter.complete(); return; }
             // Gate 3: metadata + buffer cycle completed
-            if (_gotDuration && _hasBuffered) { successCompleter.complete(); return; }
+            if (gotDuration && hasBuffered) { successCompleter.complete(); return; }
           }
 
           final widthSub = player.stream.width.listen((w) {
-            if (w != null && w > 0) { _gotWidth = true; _checkSuccess(); }
+            if (w != null && w > 0) { gotWidth = true; checkSuccess(); }
           });
           final durSub = player.stream.duration.listen((d) {
-            if (d.inMilliseconds > 0) { _gotDuration = true; _checkSuccess(); }
+            if (d.inMilliseconds > 0) { gotDuration = true; checkSuccess(); }
           });
           final playingSub = player.stream.playing.listen((playing) {
-            if (playing) { _gotPlaying = true; _checkSuccess(); }
+            if (playing) { gotPlaying = true; checkSuccess(); }
           });
           final bufferingSub = player.stream.buffering.listen((buffering) {
             if (buffering) {
-              _hasBuffered = true;
-            } else if (_hasBuffered) {
+              hasBuffered = true;
+            } else if (hasBuffered) {
               // Buffering completed → data arrived
-              _checkSuccess();
+              checkSuccess();
             }
           });
 
@@ -506,7 +525,15 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
     _attemptNumber++;
 
     if (_attemptNumber > _maxAttempts) {
-      // All 3 attempts exhausted — mark the stream as dead
+      // 3-Level Failover — same logic as channel player
+      if (_failoverLevel < 2) {
+        _failoverLevel++;
+        _attemptNumber = 0;
+        debugPrint('[Movie] ↳ Failover Level $_failoverLevel (quality degraded silently)');
+        setState(() { _autoRetrying = false; _loading = false; });
+        _startPlay();
+        return;
+      }
       if (mounted) {
         setState(() {
           _autoRetrying = false;
@@ -514,7 +541,7 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
           _streamDead   = true;
         });
       }
-      debugPrint('❌ [Movie] Stream marked dead after $_maxAttempts attempts');
+      debugPrint('❌ [Movie] Stream marked dead after all failover levels exhausted');
       return;
     }
 
@@ -534,10 +561,11 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
     });
   }
 
-  /// Manual retry — resets attempt counter so user gets a fresh 3-attempt cycle.
+  /// Manual retry — resets attempt counter AND failover level.
   void _manualRetry() {
     _retryTimer?.cancel();
     _attemptNumber = 0;
+    _failoverLevel = 0;
     setState(() { _streamDead = false; _autoRetrying = false; });
     _startPlay();
   }

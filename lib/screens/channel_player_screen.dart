@@ -9,6 +9,7 @@ import '../models/content_model.dart';
 import '../theme/app_theme.dart';
 import '../services/app_state.dart';
 import '../services/iptv_service.dart';
+import '../services/device_profile_service.dart';
 
 const _audioCh = MethodChannel('com.example.mbapp/audio');
 
@@ -67,21 +68,20 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
   // Single root focus node — handles ALL remote key events
   final FocusNode _focus = FocusNode(debugLabel: 'ChannelPlayer');
 
-  static const _ua =
-      'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 '
-      '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
+  // Failover level tracks which URL tier we are currently on:
+  //  0 = full-quality (user-selected tier)
+  //  1 = one tier lower (e.g. 1080p → 720p)
+  //  2 = lowest quality (360p fallback)
+  int _failoverLevel = 0;
 
-  /// All HTTP headers sent with every stream open() call.
-  /// These ensure compatibility with Xtream, CDN-proxied, and direct HLS streams.
-  static Map<String, String> get _streamHeaders => {
-    'User-Agent': _ua,
-    'Accept': '*/*',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Connection': 'keep-alive',
-    'Referer': '${IptvService.baseUrl}/',
-    'Origin': IptvService.baseUrl,
-    'Icy-MetaData': '1',
-  };
+  // ── Device profile — resolved once at build time ─────────────────────────
+  DeviceProfile? _deviceProfile;
+
+  DeviceProfile get _profile =>
+      _deviceProfile ?? DeviceProfileService.instance.currentProfile;
+
+  // ── Stream headers are now device-specific (not static) ──────────────────
+  Map<String, String> get _streamHeaders => _profile.streamHeaders;
 
   @override
   void initState() {
@@ -95,6 +95,8 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
     ]);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
+        // Cache the device profile once so we don't read context inside async gaps
+        _deviceProfile = context.read<AppState>().deviceProfile;
         _focus.requestFocus();
         _startPlay();
       }
@@ -196,36 +198,47 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
     final u = s.username;
     final p = s.password;
     final id = _currentItem.id;
-    // Use service-level helper: bare URL first (most compatible with Xtream servers),
-    // then .m3u8 (HLS), then .ts (MPEG-TS), then explicit bare fallback.
-    return IptvService.getLiveStreamUrlCandidates(u, p, id);
+    // Quality-tier-aware candidate list — respects the user's Settings selection.
+    // _failoverLevel 0 = user-selected tier, 1 = one step lower, 2 = lowest (360p)
+    final tier = _failoverTier(s.qualityTier);
+    return IptvService.getLiveStreamUrlCandidatesByQuality(u, p, id, tier);
+  }
+
+  /// Returns the actual tier to use based on failover level.
+  QualityTier _failoverTier(QualityTier base) {
+    if (_failoverLevel == 0) return base;
+    if (_failoverLevel == 1) {
+      switch (base) {
+        case QualityTier.uhd4k:   return QualityTier.fhd1080;
+        case QualityTier.fhd1080: return QualityTier.hd720;
+        case QualityTier.hd720:   return QualityTier.sd480;
+        case QualityTier.sd480:
+        case QualityTier.low360:
+        case QualityTier.auto:    return QualityTier.sd480;
+      }
+    }
+    return QualityTier.low360; // Level 2: absolute lowest
   }
 
   bool _isNonFatalError(String err) {
     final lower = err.toLowerCase();
-    // Subtitle / tag / codec warnings — always harmless
     if (lower.contains('subtitle')) return true;
     if (lower.contains('unsupported tag')) return true;
     if (lower.contains('skipping')) return true;
     if (lower.contains('matroska/webm: skipping')) return true;
     if (lower.contains('audio track selection')) return true;
     if (lower.contains('no audio') && lower.contains('available')) return true;
-    // Generic warning prefixes from libmpv / FFmpeg
     if (lower.startsWith('warning:')) return true;
     if (lower.contains('[warning]')) return true;
-    // Cache / buffer warnings — stream is still alive
     if (lower.contains('demuxer cache')) return true;
     if (lower.contains('cache is full')) return true;
     if (lower.contains('cache underrun')) return true;
-    // Transient EOF / read errors that resolve via reconnect
     if (lower.contains('end of file') && !lower.contains('failed')) return true;
     if (lower == 'eof' || lower.startsWith('eof ')) return true;
     if (lower.contains('read error') && lower.contains('retry')) return true;
-    // Video/audio codec info messages (not errors)
     if (lower.contains('video codec')) return true;
     if (lower.contains('audio codec')) return true;
     if (lower.contains('selected video') || lower.contains('selected audio')) return true;
-    // Packet / seek warnings that don't stop playback
     if (lower.contains('packet too large')) return true;
     if (lower.contains('pts') && lower.contains('discontinuity')) return true;
     if (lower.contains('dts') && lower.contains('discontinuity')) return true;
@@ -235,12 +248,15 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
   Future<void> _startPlay() async {
     if (!mounted) return;
 
-    // Read player settings BEFORE any await — safe synchronous context access.
-    // CRITICAL: hardware accel defaults to OFF — software decoding is
-    // universally compatible across all TV chipsets (Amlogic, MediaTek,
-    // Qualcomm, Tegra). Hardware decoding causes scrambled video on many boxes.
-    final hwAccel = context.read<AppState>().hardwareAccelEnabled;
-    final bufBytes = context.read<AppState>().bufferBytes;
+    final appState   = context.read<AppState>();
+    final hwAccel    = appState.hardwareAccelEnabled;
+    final bufBytes   = appState.bufferBytes;   // RAM-aware (may be capped by DeviceProfile)
+    final profile    = _profile;               // Device hardware profile
+
+    debugPrint('[Channel] ▶ Starting play | device=${profile.deviceClass} '
+        'brand=${profile.brand} hevc=${profile.supportsHevc} '
+        'hdr=${profile.supportsHdr} ram=${profile.totalRamMb}MB '
+        'buf=${bufBytes ~/ (1024 * 1024)}MB failoverLevel=$_failoverLevel');
 
     setState(() {
       _loading      = true;
@@ -263,20 +279,24 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
       await _requestAudio();
       final urls = _urls();
 
-      debugPrint('▶ [Channel] hwAccel=$hwAccel bufferBytes=${bufBytes ~/ (1024 * 1024)}MB');
-
       final player = Player(
         configuration: PlayerConfiguration(
           bufferSize: bufBytes,
           logLevel: MPVLogLevel.warn,
         ),
       );
-      // Apply live-optimised mpv properties for universal IPTV streaming.
-      // Covers ALL Android TV chipsets: Amlogic S905/S912/S922X, MTK MT5816/MT8695,
-      // Qualcomm, Rockchip RK3328/RK3399, Nvidia Tegra X1, Samsung Exynos, Mali GPU.
+
+      // ──────────────────────────────────────────────────────────────
+      // Universal mpv configuration — covers ALL worldwide TV brands:
+      // Samsung (Exynos/Tizen-Android), LG (webOS-Android), Sony (MTK),
+      // Xiaomi/Mi Box (Amlogic S905/S912/S922X), Haier, Hisense, Skyworth,
+      // TCL (MT5816/MT8695), Philips, Panasonic, Sharp, Toshiba,
+      // Roku (Android builds), Amazon Fire TV (MT8695), Nvidia Shield (Tegra X1),
+      // Chromecast w/ Google TV, generic Chinese boxes (Rockchip RK3328/RK3399).
+      // ──────────────────────────────────────────────────────────────
       final platform = player.platform;
       if (platform is NativePlayer) {
-        // -- Caching & buffering --
+        // ── Caching & buffering ──
         await platform.setProperty('cache', 'yes');
         await platform.setProperty('cache-secs', '30');
         await platform.setProperty('demuxer-readahead-secs', '30');
@@ -284,48 +304,84 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
         await platform.setProperty('demuxer-max-back-bytes', '${bufBytes ~/ 4}');
         // Non-blocking demuxer thread — prevents UI stall on slow SoCs (Rockchip, MTK)
         await platform.setProperty('demuxer-thread', 'yes');
-        // -- Network & reconnect --
+
+        // ── Network & reconnect ──
         await platform.setProperty('network-timeout', '15');
         await platform.setProperty('reconnect-streamed', 'yes');
         await platform.setProperty('reconnect-max-retries', '10');
         await platform.setProperty('reconnect-delay-max', '5');
         await platform.setProperty('stream-lavf-o',
             'reconnect=1,reconnect_streamed=1,reconnect_delay_max=5');
+
+        // ── AES-128 HLS & encrypted stream support ──
+        // protocol_whitelist MUST include 'crypto' for AES-128 HLS key fetching.
+        // Without this, encrypted streams fail silently on all platforms.
+        // 'data' covers inline base64 key URIs; 'file' covers local key files.
+        await platform.setProperty('demuxer-lavf-o',
+            'allowed_extensions=ALL,'
+            'protocol_whitelist=file,http,https,tcp,tls,crypto,data,ftp');
+        // Accept self-signed TLS on IPTV key servers (extremely common in the wild)
+        await platform.setProperty('tls-verify', 'no');
+        // Support TLS 1.0 – 1.3 for maximum key-server compatibility
+        await platform.setProperty('tls-min-version', '1.0');
+
+        // ── Device-specific HTTP headers ──
+        // Uses the correct User-Agent for this TV brand (Tizen/webOS/Roku/FireOS/etc.)
+        final ua      = profile.userAgent;
+        const referer = '${IptvService.baseUrl}/';
+        const origin  = IptvService.baseUrl;
         await platform.setProperty('http-header-fields',
-            'User-Agent: $_ua\nReferer: ${IptvService.baseUrl}/\nOrigin: ${IptvService.baseUrl}\nAccept: */*\nConnection: keep-alive');
-        // -- Codec / decoding --
-        // hwdec=no forces SW decoding — universally safe on ALL TV chipsets.
-        // HW decoding causes green/scrambled video on Amlogic S905, Rockchip RK3228,
-        // MTK MT5816, generic Mali GPU boxes. User can enable in Settings if needed.
+            'User-Agent: $ua\nReferer: $referer\nOrigin: $origin\nAccept: */*\nConnection: keep-alive');
+
+        // ── Codec / decoding ──
+        // hwdec: safe default is 'no' (SW decode) — universally compatible.
+        // Only Nvidia Shield or user-enabled HW accel uses auto-safe.
         await platform.setProperty('hwdec', hwAccel ? 'auto-safe' : 'no');
         // Auto thread count — let libmpv pick based on available CPU cores.
-        // Hardcoded threads=2 caused scrambling on single/odd-core SoCs.
         await platform.setProperty('vd-lavc-threads', '0');
         await platform.setProperty('vd-lavc-skiploopfilter', 'nonref');
-        // Auto SW fallback if HW decode fails mid-stream (prevents freeze/scramble)
+        // SW fallback if HW decode fails mid-stream (prevents freeze/scramble)
         await platform.setProperty('vd-lavc-software-fallback', 'yes');
         await platform.setProperty('framedrop', 'decoder+vo');
-        // -- Video output & sync --
+
+        // ── H.264 force for HEVC-unsupported devices ──
+        // Devices that can't decode HEVC will get a black screen or crash.
+        // Forcing vd-lavc-vcodec=h264 tells libavcodec to skip HEVC streams
+        // and rely on server-side transcoding or HLS alternate renditions.
+        if (profile.forceH264) {
+          await platform.setProperty('vd-lavc-vcodec', 'h264');
+          debugPrint('[Channel] H.264 forced (device has no HEVC decoder)');
+        }
+
+        // ── HDR disable on SDR-only displays ──
+        // HDR metadata on SDR screens causes washed-out / black video.
+        // 'clip' is the safest tone-mapping for SDR displays.
+        if (profile.disableHdr) {
+          await platform.setProperty('tone-mapping', 'clip');
+          await platform.setProperty('hdr-compute-peak', 'no');
+          debugPrint('[Channel] HDR tone-mapping disabled (SDR display)');
+        }
+
+        // ── Video output & sync ──
         await platform.setProperty('gpu-api', 'opengl');
         // EGL/GLES2 fallback — required on old Mali (T628/T760), Vivante GC7000,
-        // and any box where desktop OpenGL is unavailable (most Chinese TV boxes).
+        // and any box where desktop OpenGL is unavailable.
         await platform.setProperty('opengl-es', '2');
-        // Mali GPU frame-flush — prevents tearing/corruption on Mali T-series GPUs
-        // (common in generic Amlogic, Rockchip, and Samsung SoC-based boxes).
+        // Mali GPU frame-flush — prevents tearing/corruption on Mali T-series GPUs.
         await platform.setProperty('opengl-glfinish', 'yes');
-        // Anchor A/V sync to audio clock — eliminates frame scrambling caused by
-        // separate audio/video clock domains on cheaper TV SoCs.
+        // Anchor A/V sync to audio clock — eliminates frame scrambling on cheap TV SoCs.
         await platform.setProperty('video-sync', 'audio');
-        // Amlogic live-stream timestamping hack — fixes TS discontinuities that
-        // cause seeking/scrambling on Amlogic S905/S912/S922X in live mode.
-        await platform.setProperty('video-latency-hacks', 'yes');
-        // -- Audio --
+        // Amlogic live-stream timestamping hack — fixes TS discontinuities.
+        await platform.setProperty('video-latency-hacks',
+            profile.enableLatencyHacks ? 'yes' : 'no');
+
+        // ── Audio ──
         await platform.setProperty('audio-stream-silence', 'yes');
         // IMPORTANT: Do NOT use audio-spdif (HDMI passthrough) — it breaks A/V sync
         // on TVs whose HDMI receiver doesn't support AC3/EAC3 passthrough.
-        // Software audio decoding (default) works on ALL devices.
         await platform.setProperty('audio-spdif', '');
-        // -- Misc --
+
+        // ── Misc ──
         await platform.setProperty('ytdl', 'no');
         await platform.setProperty('demuxer-lavf-analyzeduration', '2');
         await platform.setProperty('demuxer-lavf-probesize', '1048576');
@@ -339,15 +395,15 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
       bool ok = false;
       String? lastError;
 
-      // 8s per-URL probe timeout for live channels — fast channel switching
+      // 8s per-URL probe timeout for live channels — fast channel switching.
       const probeTimeout = Duration(seconds: 8);
-      String? _successUrl; // remember the URL that worked for reconnect
+      String? successUrl;
 
       for (final url in urls) {
         try {
           debugPrint('▶ [Channel] $url');
 
-          // ── Fast health-check: skip obviously dead URLs immediately ──────
+          // ── Fast health-check: skip obviously dead URLs immediately ──
           final alive = await IptvService.streamHealthCheck(url)
               .timeout(const Duration(seconds: 3), onTimeout: () => true);
           if (!alive) {
@@ -367,37 +423,31 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
 
           await player.open(Media(url, httpHeaders: _streamHeaders));
 
-          // ── Relaxed success gate ─────────────────────────────────────────
-          // Accept ANY of:
-          //   (a) playing=true  — decoder confirmed active
-          //   (b) width > 0     — first video frame decoded
-          //   (c) buffering completed (after initial buffering started)
+          // ── Relaxed success gate ──
           final successCompleter = Completer<void>();
-          bool _gotWidth    = false;
-          bool _gotPlaying  = false;
-          bool _hasBuffered = false;
+          bool gotWidth    = false;
+          bool gotPlaying  = false;
+          bool hasBuffered = false;
 
-          void _checkSuccess() {
+          void checkSuccess() {
             if (successCompleter.isCompleted) return;
-            if (_gotPlaying) { successCompleter.complete(); return; }
-            if (_gotWidth)   { successCompleter.complete(); return; }
-            if (_hasBuffered) { successCompleter.complete(); return; }
+            if (gotPlaying) { successCompleter.complete(); return; }
+            if (gotWidth)   { successCompleter.complete(); return; }
+            if (hasBuffered) { successCompleter.complete(); return; }
           }
 
           final widthSub = player.stream.width.listen((w) {
-            if (w != null && w > 0) { _gotWidth = true; _checkSuccess(); }
+            if (w != null && w > 0) { gotWidth = true; checkSuccess(); }
           });
-          final durationSub = player.stream.duration.listen((_) {}); // keep sub alive
+          final durationSub = player.stream.duration.listen((_) {});
           final playingSub2 = player.stream.playing.listen((playing) {
-            if (playing) { _gotPlaying = true; _checkSuccess(); }
+            if (playing) { gotPlaying = true; checkSuccess(); }
           });
           final bufferingSub = player.stream.buffering.listen((buffering) {
             if (buffering) {
-              // started buffering — real data is flowing
-              _hasBuffered = true;
-            } else if (_hasBuffered) {
-              // buffering finished — stream is ready
-              _checkSuccess();
+              hasBuffered = true;
+            } else if (hasBuffered) {
+              checkSuccess();
             }
           });
 
@@ -419,8 +469,8 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
             continue;
           }
 
-          debugPrint('✅ Playing: $url');
-          _successUrl = url;
+          debugPrint('✅ Playing: $url (failoverLevel=$_failoverLevel)');
+          successUrl = url;
           ok = true;
           break;
         } catch (e) {
@@ -436,20 +486,17 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
       _videoCtrl = ctrl;
       await player.setVolume(_volume);
 
-      // ── Smart reconnect: on stream end, re-open the same working URL instead
-      // of full Player teardown. This avoids the ~3s delay of reinitialising libmpv.
+      // Smart reconnect on stream completion
       _completedSub = player.stream.completed.listen((done) {
         if (!done || !mounted) return;
-        if (_successUrl != null) {
-          debugPrint('↺ [Channel] Stream ended — reopening $_successUrl');
-          // Re-open the same URL on the existing player (no teardown)
+        if (successUrl != null) {
+          debugPrint('↺ [Channel] Stream ended — reopening $successUrl');
           Future.delayed(const Duration(milliseconds: 800), () {
             if (mounted && _player != null) {
-              _player!.open(Media(_successUrl!, httpHeaders: _streamHeaders));
+              _player!.open(Media(successUrl!, httpHeaders: _streamHeaders));
             }
           });
         } else {
-          // Fallback: full restart if we somehow lost the URL
           Future.delayed(const Duration(seconds: 2), _startPlay);
         }
       });
@@ -489,7 +536,22 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
     _attemptNumber++;
 
     if (_attemptNumber > _maxAttempts) {
-      // All 3 attempts exhausted — mark the stream as dead
+      // ──────────────────────────────────────────────────────────────
+      // 3-Level Failover:
+      //  Level 0 attempts exhausted → drop to Level 1 (one tier lower quality)
+      //  Level 1 attempts exhausted → drop to Level 2 (lowest 360p quality)
+      //  Level 2 attempts exhausted → mark stream dead
+      // ──────────────────────────────────────────────────────────────
+      if (_failoverLevel < 2) {
+        _failoverLevel++;
+        _attemptNumber = 0;
+        debugPrint('[Channel] ↳ Failover Level $_failoverLevel activated (quality degraded silently)');
+        // Silent quality switch — restart immediately with lower-quality URLs
+        setState(() { _autoRetrying = false; _loading = false; });
+        _startPlay();
+        return;
+      }
+      // All 3 failover levels exhausted — mark dead
       if (mounted) {
         setState(() {
           _autoRetrying = false;
@@ -497,7 +559,7 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
           _streamDead   = true;
         });
       }
-      debugPrint('❌ [Channel] Stream marked dead after $_maxAttempts attempts');
+      debugPrint('❌ [Channel] Stream marked dead after all failover levels exhausted');
       return;
     }
 
@@ -518,10 +580,12 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
     });
   }
 
-  /// Manual retry — resets attempt counter so user gets a fresh 3-attempt cycle.
+  /// Manual retry — resets attempt counter AND failover level so the user
+  /// gets a fresh full-quality 3-level cycle.
   void _manualRetry() {
     _retryTimer?.cancel();
     _attemptNumber = 0;
+    _failoverLevel = 0; // Reset to full quality on manual retry
     setState(() { _streamDead = false; _autoRetrying = false; });
     _startPlay();
   }
@@ -683,7 +747,8 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
         k.keyId == 13 ||
         k.keyId == 23 ||
         k.keyId == 96 ||
-        k.keyId == 160;    if (isSelect) {
+        k.keyId == 160;
+if (isSelect) {
       _activateZone();
       return KeyEventResult.handled;
     }
