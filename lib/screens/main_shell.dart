@@ -1,7 +1,8 @@
-﻿import 'package:flutter/material.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart';
 import '../theme/app_theme.dart';
+import '../utils/tv_remote_normalizer.dart';
 import 'home_screen.dart';
 import 'search_screen.dart';
 import 'live_tv_screen.dart';
@@ -11,19 +12,6 @@ import 'favorites_screen.dart';
 import 'settings_screen.dart';
 import 'more_screen.dart';
 
-// TV remote D-pad / Enter / Media key codes
-const _kDpadCenter  = LogicalKeyboardKey.select;
-const _kEnter       = LogicalKeyboardKey.enter;
-const _kDpadUp      = LogicalKeyboardKey.arrowUp;
-const _kDpadDown    = LogicalKeyboardKey.arrowDown;
-const _kDpadLeft    = LogicalKeyboardKey.arrowLeft;
-const _kDpadRight   = LogicalKeyboardKey.arrowRight;
-const _kBack        = LogicalKeyboardKey.goBack;
-const _kEscape      = LogicalKeyboardKey.escape;
-const _kMediaPlay   = LogicalKeyboardKey.mediaPlayPause;
-const _kMediaStop   = LogicalKeyboardKey.mediaStop;
-const _kMediaNext   = LogicalKeyboardKey.mediaTrackNext;
-const _kMediaPrev   = LogicalKeyboardKey.mediaTrackPrevious;
 
 class MainShell extends StatefulWidget {
   const MainShell({super.key});
@@ -105,108 +93,95 @@ class _MainShellState extends State<MainShell> {
     super.dispose();
   }
 
-  bool _isBackKey(LogicalKeyboardKey key) {
-    return key == _kBack ||
-           key == _kEscape ||
-           key == LogicalKeyboardKey.backspace ||
-           key.keyId == 8 ||
-           key.keyId == 27 ||
-           key.keyId == 166 ||
-           key.keyId == 0x1000000a6;
-  }
-
   bool _handleKeyEvent(KeyEvent event) {
     if (!mounted) return false;
     try {
       final route = ModalRoute.of(context);
-      if (route != null && !route.isCurrent) {
-        return false;
-      }
+      if (route != null && !route.isCurrent) return false;
     } catch (_) {}
 
-    if (event is! KeyDownEvent && event is! KeyRepeatEvent) return false;
-    final key = event.logicalKey;
+    final action = TvRemoteNormalizer.normalize(event);
+    if (action == TvNavAction.none) return false;
 
     if (kDebugMode) {
-      debugPrint('[TV Remote] Key: $key  sidebarFocused=$_sidebarFocused  isWide=$_isWide');
+      debugPrint('[TV Remote] action=$action  sidebarFocused=$_sidebarFocused  isWide=$_isWide');
     }
 
     final isWide = _isWide;
 
     try {
-      // Media keys — always let content handle them (player seek/play)
-      if (key == _kMediaPlay || key == _kMediaStop ||
-          key == _kMediaNext  || key == _kMediaPrev || key.keyId == 85) {
-        return false; // pass to focused widget (DetailScreen player)
+      // Media keys — always pass through so player screens handle them.
+      if (action == TvNavAction.play    ||
+          action == TvNavAction.pause   ||
+          action == TvNavAction.playPause ||
+          action == TvNavAction.mediaStop ||
+          action == TvNavAction.mediaNext ||
+          action == TvNavAction.mediaPrev) {
+        return false;
       }
 
-      // Handle back/escape to go back to sidebar from content
-      if (isWide && !_sidebarFocused) {
-        if (_isBackKey(key)) {
-          // If we are in a text field (typing search query) and backspace is pressed,
-          // let the text field handle the deletion instead of navigating to sidebar.
-          final primaryFocus = FocusManager.instance.primaryFocus;
-          final context = primaryFocus?.context;
-          final isTextField = context != null &&
-              (context.findAncestorWidgetOfExactType<EditableText>() != null ||
-               context.findAncestorWidgetOfExactType<TextField>() != null);
-          if (isTextField && (key == LogicalKeyboardKey.backspace || key.keyId == 8)) {
-            return false;
-          }
-
-          setState(() => _sidebarFocused = true);
-          _sidebarFocusNodes[_selectedIndex].requestFocus();
-          return true;
-        }
+      // Volume — let the system handle it (most Android TVs do this natively).
+      if (action == TvNavAction.volumeUp   ||
+          action == TvNavAction.volumeDown ||
+          action == TvNavAction.mute) {
+        return false;
       }
 
-      // On wide (TV/tablet) sidebar layout:
+      // Back from content → return focus to sidebar.
+      if (isWide && !_sidebarFocused && action == TvNavAction.back) {
+        // If a text field has focus, backspace should erase text, not navigate.
+        final primaryFocus = FocusManager.instance.primaryFocus;
+        final ctx = primaryFocus?.context;
+        final isTextField = ctx != null &&
+            (ctx.findAncestorWidgetOfExactType<EditableText>() != null ||
+             ctx.findAncestorWidgetOfExactType<TextField>() != null);
+        final isBackspace = event.logicalKey == LogicalKeyboardKey.backspace ||
+            event.logicalKey.keyId == 8;
+        if (isTextField && isBackspace) return false;
+
+        setState(() => _sidebarFocused = true);
+        _sidebarFocusNodes[_selectedIndex].requestFocus();
+        return true;
+      }
+
       if (isWide) {
         if (_sidebarFocused) {
-          // Enter/OK/Right on sidebar → move focus to content
-          if (key == _kDpadCenter || key == _kEnter || key.keyId == 13 || key.keyId == 23 || key.keyId == 96 || key == _kDpadRight || key.keyId == 39) {
+          // Select or Right on sidebar → move focus into content area.
+          if (action == TvNavAction.select || action == TvNavAction.right) {
             setState(() => _sidebarFocused = false);
             _contentFocusScopeNode.requestFocus();
             return true;
           }
-          return false;
+          return false; // let sidebar's own FocusNode handle Up/Down
         } else {
-          // TV NAV — Left arrow from content area → return to sidebar
-          if (key == _kDpadLeft || key.keyId == 37) { // TV NAV
+          // Left from content area → try spatial traversal, then fall back to sidebar.
+          if (action == TvNavAction.left) {
             final primaryFocus = FocusManager.instance.primaryFocus;
-            final isTextField = primaryFocus?.context?.widget is EditableText ||
-                                primaryFocus?.debugLabel?.contains('EditableText') == true;
-
+            final isTextField =
+                primaryFocus?.context?.widget is EditableText ||
+                primaryFocus?.debugLabel?.contains('EditableText') == true;
             if (!isTextField) {
-              final moved = primaryFocus?.focusInDirection(TraversalDirection.left) ?? false;
+              final moved =
+                  primaryFocus?.focusInDirection(TraversalDirection.left) ?? false;
               if (!moved) {
-                setState(() => _sidebarFocused = true); // TV NAV
-                _sidebarFocusNodes[_selectedIndex].requestFocus(); // TV NAV
+                setState(() => _sidebarFocused = true);
+                _sidebarFocusNodes[_selectedIndex].requestFocus();
               }
-              return true; // TV NAV
+              return true;
             }
             return false;
           }
-          // In content area: let spatial focus traversal handle remaining keys
-          return false;
+          return false; // spatial traversal handles Up/Down/Right in content
         }
       } else {
-        // Narrow (phone/mobile): Left/Right cycle bottom bar
+        // Narrow (phone/mobile): D-pad cycles through bottom-bar tabs.
         final pos = _bottomIndices.indexOf(_selectedIndex);
-        if ((key == _kDpadLeft || key.keyId == 37) && pos > 0) {
+        if ((action == TvNavAction.left || action == TvNavAction.up) && pos > 0) {
           setState(() => _selectedIndex = _bottomIndices[pos - 1]);
           return true;
         }
-        if ((key == _kDpadRight || key.keyId == 39) && pos >= 0 && pos < _bottomIndices.length - 1) {
-          setState(() => _selectedIndex = _bottomIndices[pos + 1]);
-          return true;
-        }
-        // Up/Down on narrow — navigate bottom bar items
-        if ((key == _kDpadUp || key.keyId == 38) && pos > 0) {
-          setState(() => _selectedIndex = _bottomIndices[pos - 1]);
-          return true;
-        }
-        if ((key == _kDpadDown || key.keyId == 40) && pos >= 0 && pos < _bottomIndices.length - 1) {
+        if ((action == TvNavAction.right || action == TvNavAction.down) &&
+            pos >= 0 && pos < _bottomIndices.length - 1) {
           setState(() => _selectedIndex = _bottomIndices[pos + 1]);
           return true;
         }
@@ -401,16 +376,8 @@ class _SidebarNav extends StatelessWidget {
                   }
                 },
                 onKeyEvent: (node, event) {
-                  if (event is! KeyDownEvent) return KeyEventResult.ignored;
-                  final key = event.logicalKey;
-                  if (key == LogicalKeyboardKey.select ||
-                      key == LogicalKeyboardKey.enter ||
-                      key == LogicalKeyboardKey.gameButtonA ||
-                      key.keyId == 13 ||
-                      key.keyId == 23 ||
-                      key.keyId == 96 ||
-                      key == LogicalKeyboardKey.arrowRight ||
-                      key.keyId == 39) {
+                  final action = TvRemoteNormalizer.normalize(event);
+                  if (action == TvNavAction.select || action == TvNavAction.right) {
                     onNavigateToContent();
                     return KeyEventResult.handled;
                   }
@@ -517,20 +484,16 @@ class _BottomNav extends StatelessWidget {
             child: Focus(
               autofocus: entry.realIndex == 0,
               onKeyEvent: (node, event) {
-                if (event is! KeyDownEvent && event is! KeyRepeatEvent) {
-                  return KeyEventResult.ignored;
-                }
-                if (event.logicalKey == _kDpadCenter ||
-                    event.logicalKey == _kEnter) {
+                final action = TvRemoteNormalizer.normalize(event);
+                if (action == TvNavAction.select) {
                   onTap(entry.realIndex);
                   return KeyEventResult.handled;
                 }
-                // Left/Right navigate bottom bar
-                if (event.logicalKey == _kDpadLeft) {
+                if (action == TvNavAction.left) {
                   node.previousFocus();
                   return KeyEventResult.handled;
                 }
-                if (event.logicalKey == _kDpadRight) {
+                if (action == TvNavAction.right) {
                   node.nextFocus();
                   return KeyEventResult.handled;
                 }
@@ -667,40 +630,36 @@ class _ExitDialogState extends State<_ExitDialog> {
     super.dispose();
   }
 
-  // Handle D-pad Left/Right to switch focus between the two buttons
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent && event is! KeyRepeatEvent) return KeyEventResult.ignored;
-    final k = event.logicalKey;
-
-    // Right arrow or Tab → move to Exit button
-    if (k == LogicalKeyboardKey.arrowRight || k == LogicalKeyboardKey.tab) {
-      _exitFocus.requestFocus();
-      return KeyEventResult.handled;
+    final action = TvRemoteNormalizer.normalize(event);
+    switch (action) {
+      case TvNavAction.right:
+        // Tab key also moves right — handle it separately since normalizer
+        // doesn't include Tab (Tab is a focus-traversal key, not a D-pad key).
+        _exitFocus.requestFocus();
+        return KeyEventResult.handled;
+      case TvNavAction.left:
+        _cancelFocus.requestFocus();
+        return KeyEventResult.handled;
+      case TvNavAction.select:
+        if (_focusedBtn == 1) {
+          Navigator.pop(context, true);
+        } else {
+          Navigator.pop(context, false);
+        }
+        return KeyEventResult.handled;
+      case TvNavAction.back:
+        Navigator.pop(context, false);
+        return KeyEventResult.handled;
+      default:
+        // Also handle Tab (not a TvNavAction) for keyboard users.
+        if (event is KeyDownEvent &&
+            event.logicalKey == LogicalKeyboardKey.tab) {
+          _exitFocus.requestFocus();
+          return KeyEventResult.handled;
+        }
+        return KeyEventResult.ignored;
     }
-    // Left arrow or Shift+Tab → move to Cancel button
-    if (k == LogicalKeyboardKey.arrowLeft) {
-      _cancelFocus.requestFocus();
-      return KeyEventResult.handled;
-    }
-    // Enter / Select / D-pad Center → activate focused button
-    if (k == LogicalKeyboardKey.select ||
-        k == LogicalKeyboardKey.enter ||
-        k.keyId == 13) {
-      if (_focusedBtn == 1) {
-        Navigator.pop(context, true);  // Exit
-      } else {
-        Navigator.pop(context, false); // Cancel
-      }
-      return KeyEventResult.handled;
-    }
-    // Back / Escape → cancel
-    if (k == LogicalKeyboardKey.goBack ||
-        k == LogicalKeyboardKey.escape ||
-        k.keyId == 0x1000000a6 || k.keyId == 166 || k.keyId == 8) {
-      Navigator.pop(context, false);
-      return KeyEventResult.handled;
-    }
-    return KeyEventResult.ignored;
   }
 
   Widget _buildBtn({

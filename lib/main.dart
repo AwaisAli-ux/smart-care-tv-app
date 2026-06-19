@@ -6,6 +6,7 @@ import 'theme/app_theme.dart';
 import 'services/app_state.dart';
 import 'services/device_profile_service.dart';
 import 'screens/splash_screen.dart';
+import 'utils/tv_remote_normalizer.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -14,6 +15,10 @@ void main() async {
   // This loads the native libmpv/FFmpeg libraries that provide
   // AC3, EAC3, Dolby Digital, DTS audio codec support.
   MediaKit.ensureInitialized();
+
+  // Load device-specific remote keycode overrides from assets/tv_keymaps.json.
+  // Non-fatal if the file is absent — built-in table covers most devices.
+  await TvRemoteNormalizer.loadOverrides();
 
   // Detect device hardware capabilities once at startup.
   // Result is stored in AppState and used by both player screens.
@@ -55,7 +60,13 @@ class SmartCareTVApp extends StatelessWidget {
         theme: AppTheme.darkTheme,
         shortcuts: <ShortcutActivator, Intent>{
           ...WidgetsApp.defaultShortcuts,
-          const SingleActivator(LogicalKeyboardKey.select): const ActivateIntent(),
+          // Standard remote select keys → ActivateIntent (fires onPressed/onActivate)
+          const SingleActivator(LogicalKeyboardKey.select):      const ActivateIntent(),
+          const SingleActivator(LogicalKeyboardKey.enter):       const ActivateIntent(),
+          const SingleActivator(LogicalKeyboardKey.numpadEnter): const ActivateIntent(),
+          const SingleActivator(LogicalKeyboardKey.gameButtonA): const ActivateIntent(),
+          // Space = confirm on some USB remotes and BT keyboards
+          const SingleActivator(LogicalKeyboardKey.space):       const ActivateIntent(),
         },
         home: const SplashScreen(),
       ),

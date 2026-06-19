@@ -13,13 +13,8 @@
 // ============================================================
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import '../theme/app_theme.dart';
-
-// ── Key constants ─────────────────────────────────────────────────────────────
-const _kSelect    = LogicalKeyboardKey.select;
-const _kEnter     = LogicalKeyboardKey.enter;
-const _kSpace     = LogicalKeyboardKey.space;
+import '../utils/tv_remote_normalizer.dart';
 
 // ── Helper: scroll focused widget into view ───────────────────────────────────
 void tvEnsureVisible(BuildContext context) {
@@ -133,9 +128,8 @@ class _TvFocusableState extends State<TvFocusable>
   }
 
   KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent) return KeyEventResult.ignored;
-    final key = event.logicalKey;
-    if (key == _kSelect || key == _kEnter || key == _kSpace) {
+    final action = TvRemoteNormalizer.normalize(event);
+    if (action == TvNavAction.select) {
       widget.onActivate?.call();
       return widget.onActivate != null
           ? KeyEventResult.handled
@@ -349,13 +343,11 @@ class _TvListItemState extends State<TvListItem> {
   }
 
   KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent) return KeyEventResult.ignored;
-    final key = event.logicalKey;
-    if (key == _kSelect || key == _kEnter || key == _kSpace) {
-      widget.onActivate?.call();
-      return KeyEventResult.handled;
+    if (TvRemoteNormalizer.normalize(event) != TvNavAction.select) {
+      return KeyEventResult.ignored;
     }
-    return KeyEventResult.ignored;
+    widget.onActivate?.call();
+    return KeyEventResult.handled;
   }
 
   @override

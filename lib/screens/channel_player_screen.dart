@@ -10,6 +10,7 @@ import '../theme/app_theme.dart';
 import '../services/app_state.dart';
 import '../services/iptv_service.dart';
 import '../services/device_profile_service.dart';
+import '../utils/tv_remote_normalizer.dart';
 
 const _audioCh = MethodChannel('com.example.mbapp/audio');
 
@@ -298,7 +299,7 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
       if (platform is NativePlayer) {
         // ── Caching & buffering ──
         await platform.setProperty('cache', 'yes');
-        await platform.setProperty('cache-secs', '30');
+        await platform.setProperty('cache-secs', '60');             // 60s — handles congested IPTV networks
         await platform.setProperty('demuxer-readahead-secs', '30');
         await platform.setProperty('demuxer-max-bytes', '$bufBytes');
         await platform.setProperty('demuxer-max-back-bytes', '${bufBytes ~/ 4}');
@@ -306,12 +307,13 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
         await platform.setProperty('demuxer-thread', 'yes');
 
         // ── Network & reconnect ──
-        await platform.setProperty('network-timeout', '15');
+        // Increased timeout + retries for flaky IPTV CDNs and slow ISPs worldwide
+        await platform.setProperty('network-timeout', '20');
         await platform.setProperty('reconnect-streamed', 'yes');
-        await platform.setProperty('reconnect-max-retries', '10');
+        await platform.setProperty('reconnect-max-retries', '15');
         await platform.setProperty('reconnect-delay-max', '5');
         await platform.setProperty('stream-lavf-o',
-            'reconnect=1,reconnect_streamed=1,reconnect_delay_max=5');
+            'reconnect=1,reconnect_streamed=1,reconnect_delay_max=5,listen_timeout=20000');
 
         // ── AES-128 HLS & encrypted stream support ──
         // protocol_whitelist MUST include 'crypto' for AES-128 HLS key fetching.
@@ -383,8 +385,10 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
 
         // ── Misc ──
         await platform.setProperty('ytdl', 'no');
-        await platform.setProperty('demuxer-lavf-analyzeduration', '2');
-        await platform.setProperty('demuxer-lavf-probesize', '1048576');
+        // Larger probe size + duration — better stream format detection for
+        // TS/HLS streams from non-standard IPTV encoders (fixes seek issues)
+        await platform.setProperty('demuxer-lavf-analyzeduration', '5');
+        await platform.setProperty('demuxer-lavf-probesize', '5242880');
       }
 
       final ctrl = VideoController(
@@ -682,20 +686,31 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
 
   // ── Master key handler — single source of truth for ALL remote navigation ───
   KeyEventResult _onKey(FocusNode _, KeyEvent e) {
-    if (e is! KeyDownEvent && e is! KeyRepeatEvent) return KeyEventResult.ignored;
-    final k = e.logicalKey;
+    final action = TvRemoteNormalizer.normalize(e);
+    if (action == TvNavAction.none) return KeyEventResult.ignored;
 
-    // Volume keys — always handled
-    if (k == LogicalKeyboardKey.audioVolumeUp)   { _volumeUp();   return KeyEventResult.handled; }
-    if (k == LogicalKeyboardKey.audioVolumeDown) { _volumeDown(); return KeyEventResult.handled; }
+    // Volume
+    if (action == TvNavAction.volumeUp)   { _volumeUp();   return KeyEventResult.handled; }
+    if (action == TvNavAction.volumeDown) { _volumeDown(); return KeyEventResult.handled; }
+    if (action == TvNavAction.mute) {
+      _volume = _volume > 0 ? 0 : 80;
+      _player?.setVolume(_volume);
+      _showVolumeBarBriefly();
+      return KeyEventResult.handled;
+    }
+
+    // Media transport keys
+    if (action == TvNavAction.play  ||
+        action == TvNavAction.pause ||
+        action == TvNavAction.playPause) {
+      _togglePlay();
+      return KeyEventResult.handled;
+    }
 
     if (_showOverlay) _resetHideTimer();
 
-    // Back / Escape
-    final isBack = k == LogicalKeyboardKey.goBack ||
-        k == LogicalKeyboardKey.escape ||
-        k.keyId == 0x1000000a6 || k.keyId == 166 || k.keyId == 8;
-    if (isBack) {
+    // Back
+    if (action == TvNavAction.back) {
       if (_showOverlay) {
         setState(() => _showOverlay = false);
       } else {
@@ -705,56 +720,37 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
       return KeyEventResult.handled;
     }
 
-    // Media keys
-    if (k == LogicalKeyboardKey.mediaPlayPause ||
-        k == LogicalKeyboardKey.mediaPlay ||
-        k == LogicalKeyboardKey.mediaPause) {
-      _togglePlay();
-      return KeyEventResult.handled;
-    }
-
-    // Any key while overlay hidden → show overlay
+    // Any key while overlay hidden → show overlay (and seek on Left/Right)
     if (!_showOverlay) {
-      final isSeekLeft = k == LogicalKeyboardKey.arrowLeft;
-      final isSeekRight = k == LogicalKeyboardKey.arrowRight;
       setState(() {
         _showOverlay = true;
-        if (isSeekLeft) {
+        if (action == TvNavAction.left) {
           _zone = _Zone.replay;
-        } else if (isSeekRight) {
+        } else if (action == TvNavAction.right) {
           _zone = _Zone.forward;
         } else {
           _zone = _Zone.play;
         }
       });
       _resetHideTimer();
-      if (isSeekLeft && _player != null) {
-        final target = _player!.state.position - const Duration(seconds: 10);
-        _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
-      } else if (isSeekRight && _player != null) {
-        final target = _player!.state.position + const Duration(seconds: 10);
-        _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
+      if (action == TvNavAction.left && _player != null) {
+        final t = _player!.state.position - const Duration(seconds: 10);
+        _player!.seek(t < Duration.zero ? Duration.zero : (t > _duration ? _duration : t));
+      } else if (action == TvNavAction.right && _player != null) {
+        final t = _player!.state.position + const Duration(seconds: 10);
+        _player!.seek(t < Duration.zero ? Duration.zero : (t > _duration ? _duration : t));
       }
       return KeyEventResult.handled;
     }
 
-    // Select / Enter → activate current zone
-    // Extended select: covers all TV remote OK/Enter variants
-    // 13=Enter, 23=DPAD_CENTER (Amlogic/Rockchip), 96=BUTTON_A, 160=NUMPAD_ENTER
-    final isSelect = k == LogicalKeyboardKey.select ||
-        k == LogicalKeyboardKey.enter ||
-        k == LogicalKeyboardKey.gameButtonA ||
-        k.keyId == 13 ||
-        k.keyId == 23 ||
-        k.keyId == 96 ||
-        k.keyId == 160;
-if (isSelect) {
+    // Select → activate current zone
+    if (action == TvNavAction.select) {
       _activateZone();
       return KeyEventResult.handled;
     }
 
-    // ── Arrow navigation ──────────────────────────────────────────────────────
-    if (k == LogicalKeyboardKey.arrowLeft) {
+    // ── D-pad zone navigation ─────────────────────────────────────────────────
+    if (action == TvNavAction.left) {
       setState(() {
         switch (_zone) {
           case _Zone.fav:     _zone = _Zone.back; break;
@@ -762,8 +758,8 @@ if (isSelect) {
           case _Zone.forward: _zone = _Zone.play; break;
           case _Zone.progress:
             if (_player != null) {
-              final target = _player!.state.position - const Duration(seconds: 10);
-              _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
+              final t = _player!.state.position - const Duration(seconds: 10);
+              _player!.seek(t < Duration.zero ? Duration.zero : (t > _duration ? _duration : t));
             }
             break;
           case _Zone.suggestions:
@@ -775,7 +771,7 @@ if (isSelect) {
       return KeyEventResult.handled;
     }
 
-    if (k == LogicalKeyboardKey.arrowRight) {
+    if (action == TvNavAction.right) {
       setState(() {
         switch (_zone) {
           case _Zone.back:    _zone = _Zone.fav; break;
@@ -783,8 +779,8 @@ if (isSelect) {
           case _Zone.play:    _zone = _Zone.forward; break;
           case _Zone.progress:
             if (_player != null) {
-              final target = _player!.state.position + const Duration(seconds: 10);
-              _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
+              final t = _player!.state.position + const Duration(seconds: 10);
+              _player!.seek(t < Duration.zero ? Duration.zero : (t > _duration ? _duration : t));
             }
             break;
           case _Zone.suggestions:
@@ -796,19 +792,15 @@ if (isSelect) {
       return KeyEventResult.handled;
     }
 
-    if (k == LogicalKeyboardKey.arrowUp) {
+    if (action == TvNavAction.up) {
       setState(() {
         switch (_zone) {
-          case _Zone.replay:      _zone = _Zone.back; break;
-          case _Zone.play:        _zone = _Zone.back; break;
-          case _Zone.forward:     _zone = _Zone.fav; break;
-          case _Zone.progress:    _zone = _Zone.play; break;
+          case _Zone.replay:
+          case _Zone.play:       _zone = _Zone.back; break;
+          case _Zone.forward:    _zone = _Zone.fav; break;
+          case _Zone.progress:   _zone = _Zone.play; break;
           case _Zone.suggestions:
-            if (_duration.inMilliseconds > 0) {
-              _zone = _Zone.progress;
-            } else {
-              _zone = _Zone.play;
-            }
+            _zone = _duration.inMilliseconds > 0 ? _Zone.progress : _Zone.play;
             break;
           default: break;
         }
@@ -816,7 +808,7 @@ if (isSelect) {
       return KeyEventResult.handled;
     }
 
-    if (k == LogicalKeyboardKey.arrowDown) {
+    if (action == TvNavAction.down) {
       setState(() {
         switch (_zone) {
           case _Zone.back:    _zone = _Zone.play; break;

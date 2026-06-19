@@ -9,7 +9,7 @@ publish_to: 'none'
 
 # App version: shown in Settings screen and app stores
 # Format: major.minor.patch+buildNumber
-version: 2.5.1+2
+version: 2.6.0+3
 
 # ─── SDK Constraints ──────────────────────────────────────────────────────────
 environment:
@@ -106,6 +106,7 @@ flutter:
   assets:
     - assets/images/               # App logo, placeholder posters, banners
     - assets/icons/                # Custom SVG icons (optional)
+    - assets/tv_keymaps.json       # TV remote keycode overrides (no recompile needed)
 
   # ── Fonts ──────────────────────────────────────────────────────────────────
   #

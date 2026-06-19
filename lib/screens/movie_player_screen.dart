@@ -10,6 +10,7 @@ import '../theme/app_theme.dart';
 import '../services/app_state.dart';
 import '../services/iptv_service.dart';
 import '../services/device_profile_service.dart';
+import '../utils/tv_remote_normalizer.dart';
 
 const _movieAudioCh = MethodChannel('com.example.mbapp/audio');
 
@@ -306,12 +307,13 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
         await platform.setProperty('demuxer-thread', 'yes');
 
         // ── Network & reconnect ──
-        await platform.setProperty('network-timeout', '15');
+        // Increased timeout + retries for flaky IPTV CDNs and slow ISPs worldwide
+        await platform.setProperty('network-timeout', '20');
         await platform.setProperty('reconnect-streamed', 'yes');
-        await platform.setProperty('reconnect-max-retries', '5');
+        await platform.setProperty('reconnect-max-retries', '10');
         await platform.setProperty('reconnect-delay-max', '4');
         await platform.setProperty('stream-lavf-o',
-            'reconnect=1,reconnect_streamed=1,reconnect_delay_max=4');
+            'reconnect=1,reconnect_streamed=1,reconnect_delay_max=4,listen_timeout=20000');
 
         // ── AES-128 HLS & encrypted stream support ──
         await platform.setProperty('demuxer-lavf-o',
@@ -365,8 +367,10 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
 
         // ── Misc ──
         await platform.setProperty('ytdl', 'no');
-        await platform.setProperty('demuxer-lavf-analyzeduration', '2');
-        await platform.setProperty('demuxer-lavf-probesize', '1048576');
+        // Larger probe size + duration — better stream format detection for
+        // TS/HLS streams from non-standard IPTV encoders (fixes seek issues)
+        await platform.setProperty('demuxer-lavf-analyzeduration', '5');
+        await platform.setProperty('demuxer-lavf-probesize', '5242880');
       }
 
       final ctrl = VideoController(
@@ -662,20 +666,31 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
 
   // ── Master key handler ───────────────────────────────────────────────────────
   KeyEventResult _onKey(FocusNode _, KeyEvent e) {
-    if (e is! KeyDownEvent && e is! KeyRepeatEvent) return KeyEventResult.ignored;
-    final k = e.logicalKey;
+    final action = TvRemoteNormalizer.normalize(e);
+    if (action == TvNavAction.none) return KeyEventResult.ignored;
 
-    // Volume keys — always handled
-    if (k == LogicalKeyboardKey.audioVolumeUp)   { _volumeUp();   return KeyEventResult.handled; }
-    if (k == LogicalKeyboardKey.audioVolumeDown) { _volumeDown(); return KeyEventResult.handled; }
+    // Volume
+    if (action == TvNavAction.volumeUp)   { _volumeUp();   return KeyEventResult.handled; }
+    if (action == TvNavAction.volumeDown) { _volumeDown(); return KeyEventResult.handled; }
+    if (action == TvNavAction.mute) {
+      _volume = _volume > 0 ? 0 : 80;
+      _player?.setVolume(_volume);
+      _showVolumeBarBriefly();
+      return KeyEventResult.handled;
+    }
+
+    // Media transport
+    if (action == TvNavAction.play  ||
+        action == TvNavAction.pause ||
+        action == TvNavAction.playPause) {
+      _togglePlay();
+      return KeyEventResult.handled;
+    }
 
     if (_showOverlay) _resetHideTimer();
 
-    // Back / Escape
-    final isBack = k == LogicalKeyboardKey.goBack ||
-        k == LogicalKeyboardKey.escape ||
-        k.keyId == 0x1000000a6 || k.keyId == 166 || k.keyId == 8;
-    if (isBack) {
+    // Back
+    if (action == TvNavAction.back) {
       if (_showOverlay) {
         setState(() => _showOverlay = false);
       } else {
@@ -685,55 +700,37 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
       return KeyEventResult.handled;
     }
 
-    // Media keys
-    if (k == LogicalKeyboardKey.mediaPlayPause ||
-        k == LogicalKeyboardKey.mediaPlay ||
-        k == LogicalKeyboardKey.mediaPause) {
-      _togglePlay();
-      return KeyEventResult.handled;
-    }
-
-    // Any key while overlay hidden → show overlay
+    // Any key while overlay hidden → show overlay (+ seek on Left/Right)
     if (!_showOverlay) {
-      final isSeekLeft = k == LogicalKeyboardKey.arrowLeft;
-      final isSeekRight = k == LogicalKeyboardKey.arrowRight;
       setState(() {
         _showOverlay = true;
-        if (isSeekLeft) {
+        if (action == TvNavAction.left) {
           _zone = _MZone.replay;
-        } else if (isSeekRight) {
+        } else if (action == TvNavAction.right) {
           _zone = _MZone.forward;
         } else {
           _zone = _MZone.play;
         }
       });
       _resetHideTimer();
-      if (isSeekLeft && _player != null) {
-        final target = _player!.state.position - const Duration(seconds: 10);
-        _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
-      } else if (isSeekRight && _player != null) {
-        final target = _player!.state.position + const Duration(seconds: 10);
-        _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
+      if (action == TvNavAction.left && _player != null) {
+        final t = _player!.state.position - const Duration(seconds: 10);
+        _player!.seek(t < Duration.zero ? Duration.zero : (t > _duration ? _duration : t));
+      } else if (action == TvNavAction.right && _player != null) {
+        final t = _player!.state.position + const Duration(seconds: 10);
+        _player!.seek(t < Duration.zero ? Duration.zero : (t > _duration ? _duration : t));
       }
       return KeyEventResult.handled;
     }
 
-    // Select / Enter → activate current zone
-    // Extended select: covers all TV remote OK/Enter variants
-    // 13=Enter, 23=DPAD_CENTER (Amlogic/Rockchip), 96=BUTTON_A, 160=NUMPAD_ENTER
-    final isSelect = k == LogicalKeyboardKey.select ||
-        k == LogicalKeyboardKey.enter ||
-        k == LogicalKeyboardKey.gameButtonA ||
-        k.keyId == 13 ||
-        k.keyId == 23 ||
-        k.keyId == 96 ||
-        k.keyId == 160;    if (isSelect) {
+    // Select → activate current zone
+    if (action == TvNavAction.select) {
       _activateZone();
       return KeyEventResult.handled;
     }
 
-    // ── Arrow navigation ─────────────────────────────────────────────────────
-    if (k == LogicalKeyboardKey.arrowLeft) {
+    // ── D-pad zone navigation ─────────────────────────────────────────────────
+    if (action == TvNavAction.left) {
       setState(() {
         switch (_zone) {
           case _MZone.fav:     _zone = _MZone.back; break;
@@ -741,8 +738,8 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
           case _MZone.forward: _zone = _MZone.play; break;
           case _MZone.progress:
             if (_player != null) {
-              final target = _player!.state.position - const Duration(minutes: 1);
-              _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
+              final t = _player!.state.position - const Duration(minutes: 1);
+              _player!.seek(t < Duration.zero ? Duration.zero : (t > _duration ? _duration : t));
             }
             break;
           case _MZone.suggestions:
@@ -754,7 +751,7 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
       return KeyEventResult.handled;
     }
 
-    if (k == LogicalKeyboardKey.arrowRight) {
+    if (action == TvNavAction.right) {
       setState(() {
         switch (_zone) {
           case _MZone.back:    _zone = _MZone.fav; break;
@@ -762,8 +759,8 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
           case _MZone.play:    _zone = _MZone.forward; break;
           case _MZone.progress:
             if (_player != null) {
-              final target = _player!.state.position + const Duration(minutes: 1);
-              _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
+              final t = _player!.state.position + const Duration(minutes: 1);
+              _player!.seek(t < Duration.zero ? Duration.zero : (t > _duration ? _duration : t));
             }
             break;
           case _MZone.suggestions:
@@ -775,19 +772,15 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
       return KeyEventResult.handled;
     }
 
-    if (k == LogicalKeyboardKey.arrowUp) {
+    if (action == TvNavAction.up) {
       setState(() {
         switch (_zone) {
-          case _MZone.replay:      _zone = _MZone.back; break;
-          case _MZone.play:        _zone = _MZone.back; break;
-          case _MZone.forward:     _zone = _MZone.fav; break;
-          case _MZone.progress:    _zone = _MZone.play; break;
+          case _MZone.replay:
+          case _MZone.play:      _zone = _MZone.back; break;
+          case _MZone.forward:   _zone = _MZone.fav; break;
+          case _MZone.progress:  _zone = _MZone.play; break;
           case _MZone.suggestions:
-            if (_duration.inMilliseconds > 0) {
-              _zone = _MZone.progress;
-            } else {
-              _zone = _MZone.play;
-            }
+            _zone = _duration.inMilliseconds > 0 ? _MZone.progress : _MZone.play;
             break;
           default: break;
         }
@@ -795,7 +788,7 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
       return KeyEventResult.handled;
     }
 
-    if (k == LogicalKeyboardKey.arrowDown) {
+    if (action == TvNavAction.down) {
       setState(() {
         switch (_zone) {
           case _MZone.back:

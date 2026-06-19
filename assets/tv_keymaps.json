@@ -1,0 +1,46 @@
+{
+  "_comment": "TV remote keycode override map for Smart Care TV.",
+  "_howto": [
+    "1. Connect a problem device via ADB.",
+    "2. Run:  adb shell getevent -l  (press each D-pad key, note the scancode)",
+    "   OR:  adb logcat --pid=$(adb shell pidof com.example.mbapp) | grep 'TvRemote UNKNOWN'",
+    "3. Each unknown key press logs:  logicalId = 0xXXXXXXXX (decimal)",
+    "4. Add the decimal logicalId as a string key below with the action as value.",
+    "5. Hot-reload the app (no recompile needed).",
+    "",
+    "Valid action strings: up | down | left | right | select | back |",
+    "  volumeUp | volumeDown | mute | play | pause | playPause | mediaStop |",
+    "  mediaNext | mediaPrev"
+  ],
+
+  "overrides": {
+    "_comment_format": "\"<decimal-logicalKeyId>\": \"<TvNavAction-name>\"",
+
+    "_tcl_comment": "TCL — add codes found via adb getevent for the failing model",
+    "_tcl_RC820_UP":    "add keyId decimal here → up",
+    "_tcl_RC820_DOWN":  "add keyId decimal here → down",
+    "_tcl_RC820_LEFT":  "add keyId decimal here → left",
+    "_tcl_RC820_RIGHT": "add keyId decimal here → right",
+
+    "_haier_comment": "Haier H55K6UG / H65K6UG",
+    "_haier_UP":    "add keyId decimal here",
+    "_haier_DOWN":  "add keyId decimal here",
+    "_haier_LEFT":  "add keyId decimal here",
+    "_haier_RIGHT": "add keyId decimal here",
+
+    "_skyworth_comment": "Skyworth / Coocaa (Amlogic S905X3)",
+    "_onn_comment":      "ONN Google TV (OSUIT21ANA001) — typically standard, no overrides needed",
+    "_mbox_comment":     "Xiaomi Mi Box S / Mi TV Stick — standard Android keycodes, no overrides needed",
+
+    "_real_entries_below_remove_placeholder_comments": "true"
+  },
+
+  "device_notes": {
+    "tcl_ir_vs_bt": "TCL IR remotes → Android keycode 19-23 (standard). TCL BT remotes → BT HID which maps to Android HID codes — usually also standard but some older TCL BT firmware sends KEYCODE_BUTTON_L2/R2 for left/right.",
+    "haier": "Haier often uses MTK SoC (MT5816). Remote uses IR via NEC protocol. Keycodes are standard DPAD. If broken, suspect the ATV launcher consuming keys before the app.",
+    "mi_tv": "Mi TV 4A/4X and Mi Box S use standard Android DPAD keycodes. Not a keycode problem — if broken, likely a focus issue.",
+    "onn_google_tv": "ONN OSUIT21ANA001 uses standard BT HID remote. All keys standard. No overrides expected.",
+    "rockchip_boxes": "Generic Rockchip RK3328/RK3399 boxes may send BUTTON_A (96) for OK and evdev keycodes 103/108/105/106 for DPAD — already covered in the compiled-in table.",
+    "amlogic_boxes": "Amlogic S905/S912/S922X: DPAD_CENTER arrives as keycode 23 — already covered."
+  }
+}
