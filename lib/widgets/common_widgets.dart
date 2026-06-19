@@ -486,7 +486,12 @@ class _FilterChipState extends State<_FilterChip> {
 
   KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
-    if (event.logicalKey == _kSelect || event.logicalKey == _kEnter) {
+    if (event.logicalKey == _kSelect ||
+        event.logicalKey == _kEnter ||
+        event.logicalKey.keyId == 0x10000017 ||
+        event.logicalKey.keyId == 0x100000017 ||
+        event.logicalKey.keyId == 0x1100000017 ||
+        event.logicalKey.keyId == 23) {
       widget.onSelect();
       return KeyEventResult.handled;
     }

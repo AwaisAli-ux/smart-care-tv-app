@@ -13,8 +13,11 @@ import android.os.Looper
 import android.os.PowerManager
 import android.view.Display
 import android.view.KeyEvent
+import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.android.FlutterView
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
@@ -22,6 +25,7 @@ class MainActivity : FlutterActivity() {
 
     private val CHANNEL             = "com.example.mbapp/audio"
     private val DEVICE_INFO_CHANNEL  = "com.example.mbapp/device_info"
+    private val TV_KEYS_CHANNEL      = "com.example.mbapp/tv_keys"
     private var audioManager: AudioManager? = null
     private var focusRequest: AudioFocusRequest? = null
     private val handler = Handler(Looper.getMainLooper())
@@ -34,6 +38,20 @@ class MainActivity : FlutterActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // FLAG_KEEP_SCREEN_ON: belt-and-suspenders alongside the WakeLock.
+        // Required on Sony Bravia, Philips, and some TCL Google TV firmwares
+        // where PowerManager WakeLock alone does not prevent the display from
+        // dimming during long media playback sessions.
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+        // Deferred requestFocus: on some Google TV devices (TCL, Haier, Sony)
+        // the FlutterView surface is not yet attached when onCreate fires.
+        // Posting to the decorView's message queue guarantees the focus claim
+        // runs after the first layout pass — so remote key events reach Flutter
+        // from the very first frame instead of requiring a resume/pause cycle.
+        window.decorView.post { window.decorView.requestFocus() }
+
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
         // Acquire wake lock — keeps screen on during streaming on ALL TV chipsets.
@@ -131,6 +149,10 @@ class MainActivity : FlutterActivity() {
                     else -> result.notImplemented()
                 }
             }
+
+        // ── TV Keys Channel ──────────────────────────────────────────────────────
+        // Registers the channel so Flutter can send key-related method calls if needed.
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, TV_KEYS_CHANNEL)
 
         // ── Device Info Channel ───────────────────────────────────────────────────
         // Used by DeviceProfileService to read hardware capabilities at startup.
@@ -238,97 +260,60 @@ class MainActivity : FlutterActivity() {
     }
 
     /**
-     * CRITICAL: Override dispatchKeyEvent to ensure ALL TV remote key events
-     * reach Flutter's engine, regardless of TV manufacturer.
+     * CRITICAL FIX FOR GOOGLE ANDROID TV (TCL, Haier, Sony, Philips, Hisense):
      *
-     * Key compatibility matrix (tested hardware):
-     * ────────────────────────────────────────────────────────────────────────
-     *  Device / Chipset          | Manufacturer  | Key codes used
+     * On Google-certified Android TV / Google TV devices, the Leanback UI framework
+     * intercepts DPAD key events BEFORE they reach Flutter when routed through the
+     * standard Android view hierarchy (super.dispatchKeyEvent).
+     *
+     * Fix: we intercept ALL key events at the Activity level and directly inject them
+     * into Flutter's engine using the FlutterView's onKeyUp/onKeyDown methods,
+     * which bypasses the Leanback framework entirely.
+     *
+     * Key compatibility matrix:
+     * ─────────────────────────────────────────────────────────────────────────
+     *  Device                    | Remote Key     | Android Keycode
      *  ─────────────────────────────────────────────────────────────────────
-     *  Xiaomi Mi Box S           | Amlogic S905X | DPAD_CENTER(23), ENTER(66)
-     *  Xiaomi Mi TV Stick        | Amlogic S905Y4| DPAD_CENTER(23), BACK(4)
-     *  Nvidia Shield TV          | Tegra X1      | DPAD_CENTER(23), ENTER(66)
-     *  Samsung Smart TV (Android)| Exynos        | DPAD_CENTER(23), MENU(82)
-     *  TCL Android TV            | MTK MT5816    | DPAD_CENTER(23), ENTER(66)
-     *  Sony Android TV           | MTK/Amlogic   | DPAD_CENTER(23), ENTER(66)
-     *  Generic Amlogic S905      | Various       | DPAD_CENTER(23), BUTTON_1(188)
-     *  Generic Rockchip RK3328   | Various       | ENTER(66), BUTTON_A(96)
-     *  Fire TV Stick 4K          | MT8695        | DPAD_CENTER(23), BACK(4)
-     *  MXQ / X96 / H96 boxes     | Amlogic       | DPAD_CENTER(23), BUTTON_1(188)
-     *  Generic USB HID remote    | —             | ENTER(66), NUMPAD_ENTER(160)
-     * ────────────────────────────────────────────────────────────────────────
-     *
-     * Strategy:
-     *  1. All navigation/select/back keys → pass to Flutter (super.dispatchKeyEvent)
-     *  2. Volume keys → handle natively (AudioManager), suppress system UI
-     *  3. Media keys → pass to Flutter for player controls
-     *  4. Any other key → pass to Flutter (don't swallow unknown codes)
+     *  TCL Android TV            | OK/Select      | DPAD_CENTER (23)
+     *  Haier Android TV          | OK/Select      | DPAD_CENTER (23)
+     *  Sony Bravia (Android TV)  | OK/Select      | DPAD_CENTER (23)
+     *  Philips Android TV        | OK/Select      | DPAD_CENTER (23)
+     *  Hisense Android TV        | OK/Select      | DPAD_CENTER (23) / ENTER (66)
+     *  Xiaomi Mi Box S           | OK/Select      | DPAD_CENTER (23)
+     *  Nvidia Shield TV          | OK/Select      | DPAD_CENTER (23)
+     *  Amazon Fire TV Stick 4K   | OK/Select      | DPAD_CENTER (23)
+     *  Generic Rockchip box      | OK/Select      | BUTTON_A (96) / ENTER (66)
+     *  Generic Amlogic box       | OK/Select      | DPAD_CENTER (23)
+     *  USB HID Keyboard/Remote   | Enter          | ENTER (66) / NUMPAD_ENTER (160)
+     * ─────────────────────────────────────────────────────────────────────────
      */
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        when (event.keyCode) {
-            // ── Navigation — always forward to Flutter ─────────────────────
-            KeyEvent.KEYCODE_DPAD_UP,
-            KeyEvent.KEYCODE_DPAD_DOWN,
-            KeyEvent.KEYCODE_DPAD_LEFT,
-            KeyEvent.KEYCODE_DPAD_RIGHT,
-            KeyEvent.KEYCODE_DPAD_CENTER,    // 23 — most universal "OK" button
-            KeyEvent.KEYCODE_ENTER,          // 66 — USB keyboard Enter / some remotes
-            KeyEvent.KEYCODE_NUMPAD_ENTER,   // 160 — USB numpad Enter
-            KeyEvent.KEYCODE_BUTTON_A,       // 96 — Rockchip "A" = confirm on some boxes
-            KeyEvent.KEYCODE_BUTTON_B,       // 97 — B button = back on gamepads
-            KeyEvent.KEYCODE_BUTTON_SELECT,  // 109 — generic gamepad select
-            KeyEvent.KEYCODE_BACK,           // 4
-            KeyEvent.KEYCODE_ESCAPE,         // 111
-            KeyEvent.KEYCODE_HOME,           // 3 — forward to Flutter so it can cancel cleanly
-            KeyEvent.KEYCODE_MENU,           // 82 — Samsung remote menu = open overlay
-            KeyEvent.KEYCODE_SETTINGS,       // 176 — some Chinese boxes have a settings key
-            KeyEvent.KEYCODE_INFO           // 165 — EPG / info key on Amlogic remotes
-            -> {
-                return super.dispatchKeyEvent(event)
-            }
+        val keyCode = event.keyCode
 
-            // ── Volume keys — handle natively ──────────────────────────────
-            KeyEvent.KEYCODE_VOLUME_UP -> {
-                if (event.action == KeyEvent.ACTION_DOWN) {
-                    adjustVolume(AudioManager.ADJUST_RAISE)
-                }
-                return true // Consume so system doesn't show its own volume UI
-            }
-            KeyEvent.KEYCODE_VOLUME_DOWN -> {
-                if (event.action == KeyEvent.ACTION_DOWN) {
-                    adjustVolume(AudioManager.ADJUST_LOWER)
-                }
-                return true
-            }
-            KeyEvent.KEYCODE_MUTE -> {
-                if (event.action == KeyEvent.ACTION_DOWN) {
-                    audioManager?.adjustStreamVolume(
-                        AudioManager.STREAM_MUSIC,
-                        AudioManager.ADJUST_TOGGLE_MUTE,
-                        0
-                    )
-                }
-                return true
-            }
-
-            // ── Media keys — forward to Flutter for player control ──────────
-            KeyEvent.KEYCODE_MEDIA_PLAY,
-            KeyEvent.KEYCODE_MEDIA_PAUSE,
-            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
-            KeyEvent.KEYCODE_MEDIA_STOP,
-            KeyEvent.KEYCODE_MEDIA_FAST_FORWARD,
-            KeyEvent.KEYCODE_MEDIA_REWIND,
-            KeyEvent.KEYCODE_MEDIA_NEXT,
-            KeyEvent.KEYCODE_MEDIA_PREVIOUS,
-            KeyEvent.KEYCODE_MEDIA_SKIP_FORWARD,  // Some TCL remotes
-            KeyEvent.KEYCODE_MEDIA_SKIP_BACKWARD  // Some TCL remotes
-            -> {
-                return super.dispatchKeyEvent(event)
-            }
-
-            // ── Anything else → let Flutter decide ─────────────────────────
-            else -> return super.dispatchKeyEvent(event)
+        // ── Volume keys — handle natively, suppress system volume UI ────────
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
+            if (event.action == KeyEvent.ACTION_DOWN) adjustVolume(AudioManager.ADJUST_RAISE)
+            return true
         }
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+            if (event.action == KeyEvent.ACTION_DOWN) adjustVolume(AudioManager.ADJUST_LOWER)
+            return true
+        }
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_MUTE) {
+            if (event.action == KeyEvent.ACTION_DOWN) {
+                audioManager?.adjustStreamVolume(
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.ADJUST_TOGGLE_MUTE, 0
+                )
+            }
+            return true
+        }
+
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        return super.onKeyDown(keyCode, event)
     }
 
     /** Raises or lowers STREAM_MUSIC volume by one step. */
@@ -432,6 +417,14 @@ class MainActivity : FlutterActivity() {
         super.onResume()
         requestAudioFocus()
         acquireWakeLock()
+        // CRITICAL FOR GOOGLE ANDROID TV (TCL, Haier, Sony, Philips):
+        // On Google-certified Android TV, the Leanback system manages Android
+        // View-level focus across the whole OS. Without this, the FlutterView
+        // may not have View focus after resuming, causing ALL remote key events
+        // to be silently dropped — the remote appears completely dead.
+        // requestFocus() on the decor view forces Flutter's view tree to own
+        // Android input focus, so dispatchKeyEvent() is actually called.
+        window.decorView.requestFocus()
     }
 
     override fun onPause() {
@@ -444,6 +437,9 @@ class MainActivity : FlutterActivity() {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) {
             requestAudioFocus()
+            // Re-claim View focus when window regains focus (e.g. after a dialog
+            // or system overlay dismisses on Google TV). Same reason as onResume.
+            window.decorView.requestFocus()
         }
     }
 

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -23,22 +24,22 @@ class _HomeScreenState extends State<HomeScreen> {
   late final PageController _pageCtrl;
   int _heroLength = 4;
   final FocusNode _heroBtnFocusNode = FocusNode(debugLabel: 'HeroBtn');
+  // Use a cancellable Timer instead of an unbounded Future.doWhile loop —
+  // the old loop was never garbage-collected and wasted CPU even off-screen.
+  Timer? _heroTimer;
 
   @override
   void initState() {
     super.initState();
     _pageCtrl = PageController();
-    Future.doWhile(() async {
-      await Future.delayed(const Duration(seconds: 5));
-      if (!mounted) return false;
-      if (_heroLength == 0) return true;
+    _heroTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (!mounted || _heroLength == 0) return;
       final next = (_heroIndex + 1) % _heroLength;
       if (_pageCtrl.hasClients) {
         _pageCtrl.animateToPage(next,
             duration: const Duration(milliseconds: 600),
             curve: Curves.easeInOut);
       }
-      return true;
     });
   }
 
@@ -56,6 +57,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _heroTimer?.cancel();   // ← properly releases the timer
     _pageCtrl.dispose();
     _heroBtnFocusNode.dispose();
     super.dispose();

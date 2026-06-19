@@ -602,7 +602,11 @@ class _DetailScreenState extends State<DetailScreen> {
           key == LogicalKeyboardKey.arrowUp ||
           key == LogicalKeyboardKey.arrowDown ||
           key == LogicalKeyboardKey.arrowLeft ||
-          key == LogicalKeyboardKey.arrowRight) {
+          key == LogicalKeyboardKey.arrowRight ||
+          key.keyId == 0x10000017 ||
+          key.keyId == 0x100000017 ||
+          key.keyId == 0x1100000017 ||
+          key.keyId == 23) {
         _showControlsTemporarily();
         return KeyEventResult.handled;
       }

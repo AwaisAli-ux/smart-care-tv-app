@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:provider/provider.dart';
 import '../theme/app_theme.dart';
 import '../models/content_model.dart';
 import '../services/app_state.dart';
 import '../services/iptv_service.dart';
+import '../widgets/tv_focus.dart';
 import 'main_shell.dart';
 
 class LoginScreen extends StatefulWidget {
@@ -19,6 +21,74 @@ class _LoginScreenState extends State<LoginScreen> {
   bool _obscure = true;
   bool _loading = false;
   String _statusMessage = '';
+
+  final FocusNode _userFocusNode = FocusNode(debugLabel: 'LoginUser');
+  final FocusNode _passFocusNode = FocusNode(debugLabel: 'LoginPass');
+  final FocusNode _loginFocusNode = FocusNode(debugLabel: 'LoginBtn');
+  final FocusNode _supportFocusNode = FocusNode(debugLabel: 'LoginSupport');
+
+  @override
+  void initState() {
+    super.initState();
+
+    _userFocusNode.onKeyEvent = (node, event) {
+      final isKeyboardOpen = MediaQuery.of(context).viewInsets.bottom > 0;
+      if (isKeyboardOpen) return KeyEventResult.ignored;
+
+      if (event is KeyDownEvent || event is KeyRepeatEvent) {
+        if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
+          _passFocusNode.requestFocus();
+          return KeyEventResult.handled;
+        }
+      }
+      return KeyEventResult.ignored;
+    };
+
+    _passFocusNode.onKeyEvent = (node, event) {
+      final isKeyboardOpen = MediaQuery.of(context).viewInsets.bottom > 0;
+      if (isKeyboardOpen) return KeyEventResult.ignored;
+
+      if (event is KeyDownEvent || event is KeyRepeatEvent) {
+        if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
+          _loginFocusNode.requestFocus();
+          return KeyEventResult.handled;
+        } else if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
+          _userFocusNode.requestFocus();
+          return KeyEventResult.handled;
+        }
+      }
+      return KeyEventResult.ignored;
+    };
+
+    _loginFocusNode.onKeyEvent = (node, event) {
+      if (event is KeyDownEvent || event is KeyRepeatEvent) {
+        if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
+          _passFocusNode.requestFocus();
+          return KeyEventResult.handled;
+        } else if (event.logicalKey == LogicalKeyboardKey.arrowDown) {
+          _supportFocusNode.requestFocus();
+          return KeyEventResult.handled;
+        }
+      }
+      return KeyEventResult.ignored;
+    };
+
+    _supportFocusNode.onKeyEvent = (node, event) {
+      if (event is KeyDownEvent || event is KeyRepeatEvent) {
+        if (event.logicalKey == LogicalKeyboardKey.arrowUp) {
+          _loginFocusNode.requestFocus();
+          return KeyEventResult.handled;
+        }
+      }
+      return KeyEventResult.ignored;
+    };
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _userFocusNode.requestFocus();
+      }
+    });
+  }
 
   void _login() async {
     final user = _userCtrl.text.trim();
@@ -106,17 +176,21 @@ class _LoginScreenState extends State<LoginScreen> {
   void _loadContentInBackground(AppState appState, String user, String pass) async {
     appState.setContentLoading(true);
 
-    // 1. Pre-load categories (fast)
+    // 1. Pre-load categories first (needed by both channels and movies for mapping)
     await IptvService.ensureCategoriesLoaded(user, pass).catchError((_) {});
 
-    // 2. Load Live Channels and update UI immediately
-    final ch = await IptvService.getLiveChannels(user, pass)
-        .catchError((_) => <ContentItem>[]);
-    if (ch.isNotEmpty) appState.setChannels(ch);
+    // 2. Load channels AND movies IN PARALLEL — both start at the same time.
+    //    Each future calls setState as soon as it resolves, so channels and movies
+    //    appear on screen at the same time instead of movies waiting for channels.
+    final futures = await Future.wait([
+      IptvService.getLiveChannels(user, pass).catchError((_) => <ContentItem>[]),
+      IptvService.getMovies(user, pass).catchError((_) => <ContentItem>[]),
+    ]);
 
-    // 3. Load Movies and update UI immediately
-    final mv = await IptvService.getMovies(user, pass)
-        .catchError((_) => <ContentItem>[]);
+    final ch = futures[0];
+    final mv = futures[1];
+
+    if (ch.isNotEmpty) appState.setChannels(ch);
     if (mv.isNotEmpty) appState.setMovies(mv);
 
     // All done
@@ -127,6 +201,10 @@ class _LoginScreenState extends State<LoginScreen> {
   void dispose() {
     _userCtrl.dispose();
     _passCtrl.dispose();
+    _userFocusNode.dispose();
+    _passFocusNode.dispose();
+    _loginFocusNode.dispose();
+    _supportFocusNode.dispose();
     super.dispose();
   }
 
@@ -224,8 +302,10 @@ class _LoginScreenState extends State<LoginScreen> {
           const SizedBox(height: 8),
           TextField(
             controller: _userCtrl,
+            focusNode: _userFocusNode,
             autofocus: true,
             textInputAction: TextInputAction.next,
+            onEditingComplete: () => _passFocusNode.requestFocus(),
             style: const TextStyle(
                 color: AppColors.textPrimary, fontFamily: 'Inter'),
             decoration: const InputDecoration(hintText: 'Enter your username'),
@@ -242,14 +322,17 @@ class _LoginScreenState extends State<LoginScreen> {
           const SizedBox(height: 8),
           TextField(
             controller: _passCtrl,
+            focusNode: _passFocusNode,
             obscureText: _obscure,
             textInputAction: TextInputAction.done,
             style: const TextStyle(
                 color: AppColors.textPrimary, fontFamily: 'Inter'),
+            onEditingComplete: () => _loginFocusNode.requestFocus(),
             onSubmitted: (_) => _login(),
             decoration: InputDecoration(
               hintText: 'Enter your password',
               suffixIcon: IconButton(
+                focusNode: FocusNode(skipTraversal: true),
                 icon: Icon(_obscure ? Icons.visibility_off : Icons.visibility,
                     color: AppColors.textTertiary, size: 20),
                 onPressed: () => setState(() => _obscure = !_obscure),
@@ -259,31 +342,42 @@ class _LoginScreenState extends State<LoginScreen> {
           const SizedBox(height: 24),
 
           // Button
-          SizedBox(
-            width: double.infinity,
-            height: 48,
-            child: ElevatedButton(
-              onPressed: _loading ? null : _login,
-              child: _loading
-                  ? Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        const SizedBox(
-                            width: 18,
-                            height: 18,
-                            child: CircularProgressIndicator(
-                                strokeWidth: 2, color: Colors.white)),
-                        const SizedBox(width: 12),
-                        Text(_statusMessage,
-                            style: const TextStyle(
-                                fontSize: 12, color: Colors.white70)),
-                      ],
-                    )
-                  : const Text('SIGN IN',
-                      style: TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w700,
-                          letterSpacing: 1.0)),
+          TvFocusable(
+            focusNode: _loginFocusNode,
+            onActivate: _loading ? null : _login,
+            scaleOnFocus: true,
+            borderRadius: 8,
+            child: SizedBox(
+              width: double.infinity,
+              height: 48,
+              child: ElevatedButton(
+                onPressed: _loading ? null : _login,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppColors.accent,
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                ),
+                child: _loading
+                    ? Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(
+                                  strokeWidth: 2, color: Colors.white)),
+                          const SizedBox(width: 12),
+                          Text(_statusMessage,
+                              style: const TextStyle(
+                                  fontSize: 12, color: Colors.white70)),
+                        ],
+                      )
+                    : const Text('SIGN IN',
+                        style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: 1.0)),
+              ),
             ),
           ),
           const SizedBox(height: 16),
@@ -298,18 +392,30 @@ class _LoginScreenState extends State<LoginScreen> {
                 children: [
                   const TextSpan(text: "Need an account? "),
                   WidgetSpan(
-                    child: InkWell(
-                      onTap: () => ScaffoldMessenger.of(context).showSnackBar(
+                    alignment: PlaceholderAlignment.middle,
+                    child: TvFocusable(
+                      focusNode: _supportFocusNode,
+                      scaleOnFocus: true,
+                      borderRadius: 4,
+                      onActivate: () => ScaffoldMessenger.of(context).showSnackBar(
                         const SnackBar(
                             content: Text('Contact your service provider')),
                       ),
-                      borderRadius: BorderRadius.circular(4),
-                      focusColor: AppColors.accent.withValues(alpha: 0.2),
-                      child: const Text('Contact support',
-                          style: TextStyle(
-                              color: AppColors.accent,
-                              fontSize: 12,
-                              fontFamily: 'Inter')),
+                      child: InkWell(
+                        onTap: () => ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                              content: Text('Contact your service provider')),
+                        ),
+                        borderRadius: BorderRadius.circular(4),
+                        child: const Padding(
+                          padding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                          child: Text('Contact support',
+                              style: TextStyle(
+                                  color: AppColors.accent,
+                                  fontSize: 12,
+                                  fontFamily: 'Inter')),
+                        ),
+                      ),
                     ),
                   ),
                 ],

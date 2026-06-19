@@ -4,43 +4,37 @@ import '../models/content_model.dart';
 import 'iptv_service.dart';
 import 'device_profile_service.dart';
 
-/// These brand keywords define "featured" channels.
-/// Each brand gets ONE representative at the front, interleaved randomly.
-const _kFeaturedBrands = [
-  'cnn',
-  'bbc',
-  'espn',
-  'animal planet',
-  'fox news',
-  'al jazeera',
-  'sky news',
-  'bloomberg',
-  'discovery',
-  'national geographic',
-  'nat geo',
-  'cnbc',
-  'msnbc',
-  'eurosport',
-  'sky sports',
-  'fox sports',
-  'nfl network',
-  'nba tv',
-  'beinsport',
-  'bein sport',
-  'mtv',
-  'vh1',
-  'cartoon network',
-  'disney channel',
-  'nickelodeon',
-  'hbo',
-  'showtime',
-  'history',
-  'tlc',
-  'dazn',
-  'nbc',
-  'abc news',
-  'cbs',
-];
+// ── Top-level so compute() can invoke it on a background isolate ───────────
+// Must be top-level (not a class method) for Flutter's compute() to work.
+List<ContentItem> _buildFeaturedChannelListIsolate(List<ContentItem> raw) {
+  const brandKeywords = [
+    'cnn', 'bbc', 'espn', 'animal planet', 'fox news', 'al jazeera',
+    'sky news', 'bloomberg', 'discovery', 'national geographic', 'nat geo',
+    'cnbc', 'msnbc', 'eurosport', 'sky sports', 'fox sports', 'nfl network',
+    'nba tv', 'beinsport', 'bein sport', 'mtv', 'vh1', 'cartoon network',
+    'disney channel', 'nickelodeon', 'hbo', 'showtime', 'history', 'tlc',
+    'dazn', 'nbc', 'abc news', 'cbs',
+  ];
+  final used = <String>{};
+  final featured = <ContentItem>[];
+  final remaining = <ContentItem>[];
+  for (final brand in brandKeywords) {
+    for (final ch in raw) {
+      if (used.contains(ch.id)) continue;
+      if (ch.title.toLowerCase().contains(brand)) {
+        featured.add(ch);
+        used.add(ch.id);
+        break;
+      }
+    }
+  }
+  for (final ch in raw) {
+    if (!used.contains(ch.id)) remaining.add(ch);
+  }
+  return [...featured, ...remaining];
+}
+
+
 
 class AppState extends ChangeNotifier {
   Set<String> _favoriteIds = {};
@@ -248,11 +242,15 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  void setContent(
+  /// Sets all content — channel sorting runs on a background isolate
+  /// via compute() to avoid UI jank with large channel lists (1000+ items).
+  Future<void> setContent(
       List<ContentItem> channels,
       List<ContentItem> movies,
-      List<ContentItem> series) {
-    _channels = _buildFeaturedChannelList(channels);
+      List<ContentItem> series) async {
+    // Sort channels on a background isolate — O(brands × channels) can be
+    // slow on large IPTV providers (5000+ channels) and would stutter the UI.
+    _channels = await compute(_buildFeaturedChannelListIsolate, channels);
     _movies = movies;
     _series = series;
     _isContentLoading = false;
@@ -260,8 +258,9 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  void setChannels(List<ContentItem> channels) {
-    _channels = _buildFeaturedChannelList(channels);
+  /// Updates channels only — sorting runs on a background isolate.
+  Future<void> setChannels(List<ContentItem> channels) async {
+    _channels = await compute(_buildFeaturedChannelListIsolate, channels);
     notifyListeners();
   }
 
@@ -297,7 +296,7 @@ class AppState extends ChangeNotifier {
         IptvService.getMovies(_username, _password),
         IptvService.getSeries(_username, _password),
       ]);
-      setContent(results[0], results[1], results[2]);
+      await setContent(results[0], results[1], results[2]);
       debugPrint('[AppState] refreshContent() ✅ '
           '${results[0].length} channels, ${results[1].length} movies, ${results[2].length} series');
     } catch (e) {
@@ -336,36 +335,6 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  // ── Channel ordering: diversified featured list ──────────────────────────
-  /// Builds a channel list where:
-  ///  - ONE representative of each famous brand (CNN, BBC, ESPN, etc.) is
-  ///    picked first and placed at the front in a mixed/interleaved order.
-  ///  - All remaining channels follow after.
-  ///
-  /// This ensures variety: the user sees CNN, then BBC, then ESPN, then
-  /// Animal Planet — NOT all CNN channels grouped together first.
-  static List<ContentItem> _buildFeaturedChannelList(List<ContentItem> raw) {
-    final used = <String>{};      // IDs already placed in the featured section
-    final featured = <ContentItem>[];
-    final remaining = <ContentItem>[];
-
-    // For each brand keyword, find ONE matching channel not yet selected
-    for (final brand in _kFeaturedBrands) {
-      for (final ch in raw) {
-        if (used.contains(ch.id)) continue;
-        if (ch.title.toLowerCase().contains(brand)) {
-          featured.add(ch);
-          used.add(ch.id);
-          break; // only ONE per brand keyword
-        }
-      }
-    }
-
-    // All channels not in the featured list go to remaining
-    for (final ch in raw) {
-      if (!used.contains(ch.id)) remaining.add(ch);
-    }
-
-    return [...featured, ...remaining];
-  }
 }
+// The featured-channel sorting logic lives at the top of this file
+// as _buildFeaturedChannelListIsolate() so compute() can call it.
