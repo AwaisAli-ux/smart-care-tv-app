@@ -5,14 +5,9 @@ import '../services/app_state.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
 
-class SeriesScreen extends StatefulWidget {
-  const SeriesScreen({super.key});
-  @override
-  State<SeriesScreen> createState() => _SeriesScreenState();
-}
-
-class _SeriesScreenState extends State<SeriesScreen> {
-
+class SeriesScreen extends StatelessWidget {
+  final bool sidebarFocused;
+  const SeriesScreen({super.key, this.sidebarFocused = true});
 
   @override
   Widget build(BuildContext context) {
@@ -23,10 +18,6 @@ class _SeriesScreenState extends State<SeriesScreen> {
     if (isLoading && series.isEmpty) {
       return Scaffold(
         backgroundColor: AppColors.bg,
-        appBar: AppBar(
-          title: const Text('Series'),
-          backgroundColor: AppColors.bg2,
-        ),
         body: const Center(
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -36,51 +27,74 @@ class _SeriesScreenState extends State<SeriesScreen> {
                 strokeWidth: 3,
               ),
               SizedBox(height: 16),
-              Text('Loading series...',
-                  style:
-                      TextStyle(color: AppColors.textSecondary, fontSize: 13)),
+              Text(
+                'Loading series…',
+                style: TextStyle(color: AppColors.textSecondary, fontSize: 13),
+              ),
+              SizedBox(height: 6),
+              Text(
+                'This may take a moment',
+                style: TextStyle(color: AppColors.textTertiary, fontSize: 11),
+              ),
             ],
           ),
         ),
       );
     }
 
-    if (series.isEmpty) {
+    if (!isLoading && series.isEmpty) {
       return Scaffold(
         backgroundColor: AppColors.bg,
-        appBar: AppBar(
-          title: const Text('Series'),
-          backgroundColor: AppColors.bg2,
-        ),
-        body: const Center(
+        body: Center(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(Icons.video_library,
-                  color: AppColors.textTertiary, size: 48),
-              SizedBox(height: 16),
-              Text('No series available',
-                  style:
-                      TextStyle(color: AppColors.textSecondary, fontSize: 14)),
+              const Icon(Icons.tv, color: AppColors.textTertiary, size: 64),
+              const SizedBox(height: 20),
+              const Text(
+                'No Series Found',
+                style: TextStyle(
+                  color: AppColors.textPrimary,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Series will appear here once loaded.\nCheck your connection or try refreshing.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: AppColors.textSecondary, fontSize: 13, height: 1.5),
+              ),
+              const SizedBox(height: 24),
+              ElevatedButton.icon(
+                onPressed: () => appState.refreshContent(),
+                icon: const Icon(Icons.refresh, size: 18),
+                label: const Text('Refresh Content'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppColors.accent,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                ),
+              ),
             ],
           ),
         ),
       );
     }
 
-
+    final sorted = appState.sortedSeries;
 
     return Scaffold(
       backgroundColor: AppColors.bg,
-      appBar: AppBar(
-        title: const Text('Series'),
-        backgroundColor: AppColors.bg2,
-      ),
       body: Column(
         children: [
           const SizedBox(height: 8),
           Expanded(
-            child: ContentGrid(items: series, autoFocusFirst: true),
+            child: ContentGrid(
+              items: sorted,
+              autoFocusFirst: !sidebarFocused,
+              restorationKey: 'series', // FIX #7
+            ),
           ),
         ],
       ),

@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import '../theme/app_theme.dart';
 import '../widgets/tv_focus.dart';
 import '../services/app_state.dart';
+import '../services/cache_service.dart';
 
 enum SettingsTab {
   videoQuality,
@@ -24,7 +25,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final FocusNode _firstSubTabFocusNode = FocusNode(debugLabel: 'FirstSubTab');
 
   // Platform channel for native app restart
-  static const _nativeCh = MethodChannel('com.example.mbapp/audio');
+  static const _nativeCh = MethodChannel('com.smartcaretv.app/audio');
 
   // Notifications state
   bool _notifContent = true;
@@ -611,12 +612,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
         _buildActionRow(
           title: 'Clear Cache',
-          subtitle: 'Free up storage space',
+          subtitle: 'Free up storage space and RAM',
           actionText: 'Clear',
-          onTap: () {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('Cache cleared'), backgroundColor: AppColors.bg4),
-            );
+          onTap: () async {
+            final freed = await CacheService.clearDiskCache();
+            if (mounted) {
+              final mb = (freed / (1024 * 1024)).toStringAsFixed(1);
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('Cache cleared — $mb MB freed'),
+                  backgroundColor: AppColors.bg4,
+                ),
+              );
+            }
           },
         ),
 

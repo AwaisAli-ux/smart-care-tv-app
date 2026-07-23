@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -10,6 +12,7 @@ import '../services/app_state.dart';
 import 'detail_screen.dart';
 import 'channel_player_screen.dart';
 import 'movie_player_screen.dart';
+import '../utils/player_navigation.dart';
 
 class HomeScreen extends StatefulWidget {
   final bool sidebarFocused;
@@ -19,53 +22,31 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  int _heroIndex = 0;
-  late final PageController _pageCtrl;
-  int _heroLength = 4;
-  final FocusNode _heroBtnFocusNode = FocusNode(debugLabel: 'HeroBtn');
+  List<ContentItem> _heroItems = [];
+  final _rng = Random();
 
-  @override
-  void initState() {
-    super.initState();
-    _pageCtrl = PageController();
-    Future.doWhile(() async {
-      await Future.delayed(const Duration(seconds: 5));
-      if (!mounted) return false;
-      if (_heroLength == 0) return true;
-      final next = (_heroIndex + 1) % _heroLength;
-      if (_pageCtrl.hasClients) {
-        _pageCtrl.animateToPage(next,
-            duration: const Duration(milliseconds: 600),
-            curve: Curves.easeInOut);
-      }
-      return true;
-    });
-  }
-
-  @override
-  void didUpdateWidget(HomeScreen oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.sidebarFocused && !widget.sidebarFocused) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) {
-          _heroBtnFocusNode.requestFocus();
-        }
-      });
-    }
-  }
-
-  @override
-  void dispose() {
-    _pageCtrl.dispose();
-    _heroBtnFocusNode.dispose();
-    super.dispose();
+  /// Builds the hero items list once per session (random on every app open).
+  List<ContentItem> _buildHeroItems(AppState appState) {
+    if (_heroItems.isNotEmpty) return _heroItems;
+    final pool = <ContentItem>[
+      ...appState.channels.take(30),
+      ...appState.englishMovies.take(50),
+      ...appState.englishSeries.take(30),
+    ];
+    if (pool.isEmpty) return [];
+    pool.shuffle(_rng);
+    _heroItems = pool
+        .where((x) => (x.backdropUrl ?? x.imageUrl).isNotEmpty)
+        .take(8)
+        .toList();
+    if (_heroItems.length < 3) _heroItems = pool.take(6).toList();
+    return _heroItems;
   }
 
   @override
   Widget build(BuildContext context) {
     final appState = context.watch<AppState>();
     final channels = appState.channels;
-    final movies = appState.movies;
     final isLoading = appState.isContentLoading;
 
     if (isLoading && !appState.hasContent) {
@@ -126,13 +107,15 @@ class _HomeScreenState extends State<HomeScreen> {
       );
     }
 
-    final heroItems = <ContentItem>[];
-    if (movies.length > 1) heroItems.add(movies[1]);
-    if (channels.isNotEmpty) heroItems.add(channels.first);
-    if (movies.length > 3) heroItems.add(movies[3]);
-    if (movies.length > 5) heroItems.add(movies[5]);
-    if (movies.length > 8) heroItems.add(movies[8]);
-    _heroLength = heroItems.length;
+    // Build random hero items once per session
+    final heroItems = _buildHeroItems(appState);
+
+    // ── English/US-first filter helpers ──────────────────────────────
+    final englishSeries = appState.englishSeries;
+    final englishMovies = appState.englishMovies;
+
+    // Latest movies (alias for bottom section — same list)
+    final latestMovies = englishMovies;
 
     return Scaffold(
       backgroundColor: AppColors.bg,
@@ -141,14 +124,11 @@ class _HomeScreenState extends State<HomeScreen> {
           // Hero Banner
           if (heroItems.isNotEmpty)
             SliverToBoxAdapter(
-                child: _HeroBanner(
-              items: heroItems,
-              controller: _pageCtrl,
-              onPageChanged: (i) => setState(() => _heroIndex = i),
-              heroIndex: _heroIndex,
-              heroBtnFocusNode: _heroBtnFocusNode,
-              autofocus: !widget.sidebarFocused,
-            )),
+              child: _HeroBanner(
+                items: heroItems,
+                sidebarFocused: widget.sidebarFocused,
+              ),
+            ),
 
           // Loading indicator at top when refreshing in background
           if (isLoading && appState.hasContent)
@@ -184,30 +164,10 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ],
 
-          // Latest Movies — show up to 20
-          if (movies.isNotEmpty) ...[
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 20, 16, 12),
-                child: SectionHeader(title: 'Latest Movies'),
-              ),
-            ),
-            SliverToBoxAdapter(
-              child: SizedBox(
-                height: 200,
-                child: ListView.separated(
-                  scrollDirection: Axis.horizontal,
-                  padding: const EdgeInsets.symmetric(horizontal: 16),
-                  itemCount: movies.length > 20 ? 20 : movies.length,
-                  separatorBuilder: (_, __) => const SizedBox(width: 12),
-                  itemBuilder: (_, i) => MediaCard(item: movies[i]),
-                ),
-              ),
-            ),
-          ],
 
-          // Trending Movies (offset set for variety)
-          if (movies.length > 20) ...[
+
+          // Trending Movies — English only, newest first
+          if (englishMovies.length > 20) ...[
             SliverToBoxAdapter(
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(16, 20, 16, 12),
@@ -220,9 +180,53 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: ListView.separated(
                   scrollDirection: Axis.horizontal,
                   padding: const EdgeInsets.symmetric(horizontal: 16),
-                  itemCount: movies.length > 40 ? 20 : movies.length - 20,
+                  itemCount: englishMovies.length > 40 ? 20 : englishMovies.length - 20,
                   separatorBuilder: (_, __) => const SizedBox(width: 12),
-                  itemBuilder: (_, i) => MediaCard(item: movies[i + 20]),
+                  itemBuilder: (_, i) => MediaCard(item: englishMovies[i + 20]),
+                ),
+              ),
+            ),
+          ],
+
+          // Popular Series — English/US only, newest first
+          if (englishSeries.isNotEmpty) ...[
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 20, 16, 12),
+                child: SectionHeader(title: 'Popular Series'),
+              ),
+            ),
+            SliverToBoxAdapter(
+              child: SizedBox(
+                height: 200,
+                child: ListView.separated(
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  itemCount: englishSeries.length > 20 ? 20 : englishSeries.length,
+                  separatorBuilder: (_, __) => const SizedBox(width: 12),
+                  itemBuilder: (_, i) => MediaCard(item: englishSeries[i]),
+                ),
+              ),
+            ),
+          ],
+
+          // Latest Movies — English only, newest first
+          if (latestMovies.isNotEmpty) ...[
+            SliverToBoxAdapter(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 20, 16, 12),
+                child: SectionHeader(title: 'Latest Movies'),
+              ),
+            ),
+            SliverToBoxAdapter(
+              child: SizedBox(
+                height: 200,
+                child: ListView.separated(
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  itemCount: latestMovies.length > 20 ? 20 : latestMovies.length,
+                  separatorBuilder: (_, __) => const SizedBox(width: 12),
+                  itemBuilder: (_, i) => MediaCard(item: latestMovies[i]),
                 ),
               ),
             ),
@@ -258,22 +262,86 @@ class _HomeScreenState extends State<HomeScreen> {
 }
 
 // ─── Hero Banner ─────────────────────────────────────────────────────────────
-class _HeroBanner extends StatelessWidget {
+class _HeroBanner extends StatefulWidget {
   final List<ContentItem> items;
-  final PageController controller;
-  final ValueChanged<int> onPageChanged;
-  final int heroIndex;
-  final FocusNode heroBtnFocusNode;
-  final bool autofocus;
+  final bool sidebarFocused;
 
   const _HeroBanner({
     required this.items,
-    required this.controller,
-    required this.onPageChanged,
-    required this.heroIndex,
-    required this.heroBtnFocusNode,
-    required this.autofocus,
+    required this.sidebarFocused,
   });
+
+  @override
+  State<_HeroBanner> createState() => _HeroBannerState();
+}
+
+class _HeroBannerState extends State<_HeroBanner> {
+  int _heroIndex = 0;
+  late final PageController _pageCtrl;
+  final FocusNode _heroBtnFocusNode = FocusNode(debugLabel: 'HeroBtn');
+  Timer? _heroTimer;
+
+  // FIX #11 — the moment the user takes control the carousel stops advancing
+  // on its own and never restarts; nothing should move under their thumb.
+  bool _userTookControl = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // viewportFraction < 1 lets the neighbouring slides peek in, which is what
+    // the scale/rotation treatment needs in order to read as a carousel.
+    _pageCtrl = PageController(viewportFraction: 0.88);
+    _heroBtnFocusNode.addListener(_onHeroFocusChange);
+    _startTimer();
+  }
+
+  void _onHeroFocusChange() {
+    // FIX #11 — auto-advance only while the slider is NOT focused.
+    if (_heroBtnFocusNode.hasFocus && !_userTookControl) {
+      setState(() => _userTookControl = true);
+      _heroTimer?.cancel();
+    }
+  }
+
+  void _startTimer() {
+    _heroTimer?.cancel();
+    if (widget.items.isEmpty || _userTookControl) return;
+    _heroTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (!mounted || widget.items.isEmpty || _userTookControl) return;
+      final next = (_heroIndex + 1) % widget.items.length;
+      if (_pageCtrl.hasClients) {
+        _pageCtrl.animateToPage(
+          next,
+          duration: const Duration(milliseconds: 600),
+          curve: Curves.easeInOut,
+        );
+      }
+    });
+  }
+
+  @override
+  void didUpdateWidget(_HeroBanner oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.items.length != oldWidget.items.length) {
+      _startTimer();
+    }
+    if (oldWidget.sidebarFocused && !widget.sidebarFocused) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          _heroBtnFocusNode.requestFocus();
+        }
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _heroTimer?.cancel();
+    _pageCtrl.dispose();
+    _heroBtnFocusNode.removeListener(_onHeroFocusChange);
+    _heroBtnFocusNode.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -283,28 +351,79 @@ class _HeroBanner extends StatelessWidget {
       child: Stack(
         children: [
           PageView.builder(
-            controller: controller,
-            onPageChanged: onPageChanged,
-            itemCount: items.length,
-            itemBuilder: (_, i) => _HeroSlide(
-              item: items[i],
-              focusNode: i == heroIndex ? heroBtnFocusNode : null,
-              autofocus: autofocus && i == heroIndex,
-            ),
+            controller: _pageCtrl,
+            onPageChanged: (i) {
+              setState(() {
+                _heroIndex = i;
+              });
+            },
+            itemCount: widget.items.length,
+            itemBuilder: (_, i) {
+              // FIX #11 — centre slide is full size; neighbours shrink and
+              // rotate away. Fake 3D via a perspective matrix only: no shader,
+              // no real mesh, no blur.
+              return AnimatedBuilder(
+                animation: _pageCtrl,
+                builder: (ctx, child) {
+                  // How far this slide is from the centre, in pages.
+                  double offset = i.toDouble() - _heroIndex;
+                  if (_pageCtrl.hasClients && _pageCtrl.position.haveDimensions) {
+                    offset = i - (_pageCtrl.page ?? _heroIndex.toDouble());
+                  }
+                  final clamped = offset.clamp(-1.0, 1.0);
+                  final scale = 1.0 - (clamped.abs() * 0.12); // 1.0 → 0.88
+                  final matrix = Matrix4.identity()
+                    ..setEntry(3, 2, 0.0012) // perspective
+                    ..rotateY(clamped * 0.25)
+                    ..scaleByDouble(scale, scale, 1.0, 1.0);
+                  return Transform(
+                    transform: matrix,
+                    alignment: Alignment.center,
+                    child: child,
+                  );
+                },
+                child: RepaintBoundary(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 6),
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(14),
+                        // One shadow, not a stack of them.
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withValues(alpha: 0.45),
+                            blurRadius: 18,
+                            offset: const Offset(0, 6),
+                          ),
+                        ],
+                      ),
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(14),
+                        child: _HeroSlide(
+                          item: widget.items[i],
+                          focusNode: i == _heroIndex ? _heroBtnFocusNode : null,
+                          autofocus: !widget.sidebarFocused && i == _heroIndex,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            },
           ),
           // Dots
           Positioned(
             bottom: 16,
             right: 20,
             child: Row(
-              children: List.generate(items.length, (i) {
+              children: List.generate(widget.items.length, (i) {
                 return AnimatedContainer(
                   duration: const Duration(milliseconds: 250),
-                  width: i == heroIndex ? 20 : 6,
+                  width: i == _heroIndex ? 20 : 6,
                   height: 6,
                   margin: const EdgeInsets.symmetric(horizontal: 2),
                   decoration: BoxDecoration(
-                    color: i == heroIndex
+                    color: i == _heroIndex
                         ? AppColors.accent
                         : AppColors.textTertiary,
                     borderRadius: BorderRadius.circular(3),
@@ -330,11 +449,15 @@ class _HeroSlide extends StatelessWidget {
     this.autofocus = false,
   });
 
-  void _open(BuildContext context) {
+  Future<void> _open(BuildContext context) async {
     if (item.isLive) {
+      await preRotateForPlayer();
+      if (!context.mounted) return;
       Navigator.push(
           context, MaterialPageRoute(builder: (_) => ChannelPlayerScreen(item: item)));
     } else if (item.isMovie) {
+      await preRotateForPlayer();
+      if (!context.mounted) return;
       Navigator.push(
           context, MaterialPageRoute(builder: (_) => MoviePlayerScreen(item: item)));
     } else {
@@ -351,13 +474,18 @@ class _HeroSlide extends StatelessWidget {
         fit: StackFit.expand,
         children: [
           // Background image
-          if (item.imageUrl.isNotEmpty)
+          if ((item.backdropUrl ?? item.imageUrl).isNotEmpty)
             CachedNetworkImage(
-                imageUrl: item.imageUrl,
+                imageUrl: (item.backdropUrl != null && item.backdropUrl!.isNotEmpty)
+                    ? item.backdropUrl!
+                    : item.imageUrl,
                 fit: BoxFit.cover,
                 width: double.infinity,
                 height: double.infinity,
-                memCacheWidth: 600,
+                // FIX #11 — decode at roughly the width actually drawn (the
+                // slide is ~88% of the viewport) instead of a flat 600px.
+                memCacheWidth:
+                    (MediaQuery.sizeOf(context).width * 0.9).round(),
                 errorWidget: (_, __, ___) => Container(color: AppColors.bg4))
           else
             Container(color: AppColors.bg4),

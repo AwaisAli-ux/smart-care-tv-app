@@ -30,15 +30,136 @@ Map<String, dynamic> _parseJsonMap(String body) {
   return {};
 }
 
+/// Parses the raw VOD JSON AND maps it straight to [ContentItem]s, all on
+/// the background isolate compute() spins up. Previously only the JSON
+/// decode ran in compute() and the .map().toList() into ContentItem objects
+/// (100k+ items on large catalogues) ran synchronously back on the main
+/// isolate right as the app starts — real, non-trivial CPU work landing on
+/// the same merged UI/platform thread Android needs to ack window-focus
+/// events on, contributing to "Waited Xms for FocusEvent" ANRs if a channel
+/// tap lands while this is still running.
+List<ContentItem> _parseAndMapMovies(Map<String, dynamic> args) {
+  final body = args['body'] as String;
+  final cats = args['cats'] as Map<String, String>;
+  final data = _parseJsonList(body);
+  return data
+      .where((item) =>
+          item is Map &&
+          item['stream_id'] != null &&
+          item['stream_id'].toString().isNotEmpty)
+      .map<ContentItem>((item) {
+    final catId = item['category_id']?.toString() ?? '';
+    final catName = cats[catId] ?? catId;
+    final ext =
+        (item['container_extension']?.toString() ?? 'mp4').toLowerCase();
+    final title = item['name']?.toString() ?? 'Unknown';
+
+    int? parsedYear;
+    final match = RegExp(r'\((\d{4})\)').firstMatch(title);
+    if (match != null) {
+      parsedYear = int.tryParse(match.group(1)!);
+    }
+    if (parsedYear == null) {
+      final match2 = RegExp(r'\b(19\d{2}|20\d{2})\b').firstMatch(title);
+      if (match2 != null) {
+        parsedYear = int.tryParse(match2.group(1)!);
+      }
+    }
+    parsedYear ??=
+        IptvService._parseYear(item['year'] ?? item['releaseDate'] ?? item['added']);
+
+    return ContentItem(
+      id: item['stream_id']?.toString() ?? '',
+      type: ContentType.movie,
+      title: title,
+      imageUrl: item['stream_icon']?.toString() ?? '',
+      category: catName,
+      genre: IptvService._cleanGenre(catName),
+      rating: IptvService._parseRating(item['rating']),
+      year: parsedYear,
+      description: item['plot']?.toString(),
+      duration: item['duration']?.toString(),
+      containerExtension: ext.isEmpty ? 'mp4' : ext,
+    );
+  }).toList();
+}
+
+/// Same rationale as [_parseAndMapMovies] — parses AND maps series JSON
+/// entirely on the background isolate instead of leaving the .map().toList()
+/// into ContentItem objects to run on the main isolate.
+List<ContentItem> _parseAndMapSeries(Map<String, dynamic> args) {
+  final body = args['body'] as String;
+  final cats = args['cats'] as Map<String, String>;
+  final data = _parseJsonList(body);
+  return data
+      .where((item) =>
+          item is Map &&
+          item['series_id'] != null &&
+          item['series_id'].toString().isNotEmpty)
+      .map<ContentItem>((item) {
+    final catId = item['category_id']?.toString() ?? '';
+    final catName = cats[catId] ?? catId;
+    final episodeCount = item['num'] is int
+        ? item['num'] as int
+        : int.tryParse(item['num']?.toString() ?? '');
+    final title = item['name']?.toString() ?? 'Unknown';
+    int? parsedYear;
+    final match = RegExp(r'\((\d{4})\)').firstMatch(title);
+    if (match != null) {
+      parsedYear = int.tryParse(match.group(1)!);
+    }
+    if (parsedYear == null) {
+      final match2 = RegExp(r'\b(19\d{2}|20\d{2})\b').firstMatch(title);
+      if (match2 != null) {
+        parsedYear = int.tryParse(match2.group(1)!);
+      }
+    }
+    parsedYear ??= IptvService._parseYear(
+        item['releaseDate'] ?? item['last_modified'] ?? item['year']);
+
+    return ContentItem(
+      id: item['series_id']?.toString() ?? '',
+      type: ContentType.series,
+      title: title,
+      imageUrl: item['cover']?.toString() ?? '',
+      backdropUrl: item['backdrop_path'] is List &&
+              (item['backdrop_path'] as List).isNotEmpty
+          ? item['backdrop_path'][0]?.toString()
+          : null,
+      category: catName,
+      genre: IptvService._cleanGenre(catName),
+      rating: IptvService._parseRating(item['rating']),
+      year: parsedYear,
+      description: item['plot']?.toString(),
+      episodeCount: episodeCount,
+    );
+  }).toList();
+}
+
 class IptvService {
-  static const String baseUrl = 'http://fulltv.vip:25461';
+  /// Runtime-configurable server URL. Starts empty — must be set via
+  /// setBaseUrl() from the user's login input before any API calls are made.
+  static String baseUrl = '';
+
+  /// Update the base URL (call before authenticate() when the user provides a
+  /// custom server). Trailing slashes are stripped for consistency.
+  static void setBaseUrl(String url) {
+    String sanitized = url.trim();
+    if (!sanitized.startsWith('http://') && !sanitized.startsWith('https://')) {
+      sanitized = 'http://$sanitized';
+    }
+    baseUrl = sanitized.replaceAll(RegExp(r'/+$'), '');
+    debugPrint('[IptvService] baseUrl updated → $baseUrl');
+  }
+
   static const String _ua =
       'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 '
       '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
 
   /// Standard HTTP headers sent with EVERY stream request.
   /// Covers Xtream-compatible servers, HLS proxies, and CDN-backed streams.
-  static const Map<String, String> streamHeaders = {
+  /// Uses getters so they always reflect the current baseUrl.
+  static Map<String, String> get streamHeaders => {
     'User-Agent': _ua,
     'Accept': '*/*',
     'Accept-Language': 'en-US,en;q=0.9',
@@ -96,9 +217,23 @@ class IptvService {
   /// true if the server responds with a non-4xx, non-5xx status code.
   /// Timeout is 5 seconds — just enough to skip clearly dead URLs before
   /// the media player spends 20s waiting on them.
+  /// TEMPORARY diagnostic bypass — when true, streamHealthCheck() always
+  /// returns true immediately without sending a HEAD request. Used to test
+  /// whether the HEAD request itself (many Xtream panels mishandle HEAD on
+  /// live endpoints) is the source of the main-isolate freeze.
+  static bool debugBypassHealthCheck = false;
+
   static Future<bool> streamHealthCheck(String url) async {
+    final entered = DateTime.now();
+    debugPrint('[HealthCheck] ENTER @$entered url=$url bypass=$debugBypassHealthCheck');
+    if (debugBypassHealthCheck) {
+      debugPrint('[HealthCheck] BYPASS — skipping HEAD request');
+      return true;
+    }
     try {
       final uri = Uri.parse(url);
+      final beforeHead = DateTime.now();
+      debugPrint('[HealthCheck] before _client.head() @$beforeHead url=$url');
       // Try HEAD first (no body downloaded)
       final head = await _client
           .head(uri, headers: {
@@ -108,6 +243,8 @@ class IptvService {
             'Range': 'bytes=0-1023', // request tiny range
           })
           .timeout(const Duration(seconds: 5));
+      debugPrint('[HealthCheck] after _client.head() — took '
+          '${DateTime.now().difference(beforeHead).inMilliseconds}ms url=$url');
       final code = head.statusCode;
       if (code == 403 || code == 404 || code >= 500) {
         debugPrint('[HealthCheck] ❌ $code for $url');
@@ -116,9 +253,13 @@ class IptvService {
       debugPrint('[HealthCheck] ✅ $code for $url');
       return true;
     } catch (e) {
-      debugPrint('[HealthCheck] ⚠ timeout/error for $url: $e');
+      debugPrint('[HealthCheck] ⚠ timeout/error for $url: $e — total elapsed '
+          '${DateTime.now().difference(entered).inMilliseconds}ms');
       // Don't skip on timeout — server might accept player but not HEAD requests
       return true;
+    } finally {
+      debugPrint('[HealthCheck] EXIT — total elapsed '
+          '${DateTime.now().difference(entered).inMilliseconds}ms url=$url');
     }
   }
 
@@ -230,34 +371,9 @@ class IptvService {
           debugPrint('[IPTV Service] Movies response body start: ${response.body.substring(0, 300)}');
         }
         await ensureCategoriesLoaded(username, password);
-        final List<dynamic> data =
-            await compute(_parseJsonList, response.body);
-        debugPrint('[IPTV Service] Parsed movie items count: ${data.length}');
         final cats = Map<String, String>.from(_vodCats);
-        final list = data
-            .where((item) =>
-                item is Map &&
-                item['stream_id'] != null &&
-                item['stream_id'].toString().isNotEmpty)
-            .map<ContentItem>((item) {
-          final catId = item['category_id']?.toString() ?? '';
-          final catName = cats[catId] ?? catId;
-          final ext =
-              (item['container_extension']?.toString() ?? 'mp4').toLowerCase();
-          return ContentItem(
-            id: item['stream_id']?.toString() ?? '',
-            type: ContentType.movie,
-            title: item['name']?.toString() ?? 'Unknown',
-            imageUrl: item['stream_icon']?.toString() ?? '',
-            category: catName,
-            genre: _cleanGenre(catName),
-            rating: _parseRating(item['rating']),
-            year: _parseYear(item['added']),
-            description: item['plot']?.toString(),
-            duration: item['duration']?.toString(),
-            containerExtension: ext.isEmpty ? 'mp4' : ext,
-          );
-        }).toList();
+        final list = await compute(
+            _parseAndMapMovies, {'body': response.body, 'cats': cats});
         debugPrint('[IPTV Service] Mapped movie ContentItems count: ${list.length}');
         return list;
       }
@@ -277,37 +393,9 @@ class IptvService {
       final response = await _get(url, timeout: const Duration(seconds: 60));
       if (response.statusCode == 200 && response.body.isNotEmpty) {
         await ensureCategoriesLoaded(username, password);
-        final List<dynamic> data =
-            await compute(_parseJsonList, response.body);
         final cats = Map<String, String>.from(_seriesCats);
-        return data
-            .where((item) =>
-                item is Map &&
-                item['series_id'] != null &&
-                item['series_id'].toString().isNotEmpty)
-            .map<ContentItem>((item) {
-          final catId = item['category_id']?.toString() ?? '';
-          final catName = cats[catId] ?? catId;
-          final episodeCount = item['num'] is int
-              ? item['num'] as int
-              : int.tryParse(item['num']?.toString() ?? '');
-          return ContentItem(
-            id: item['series_id']?.toString() ?? '',
-            type: ContentType.series,
-            title: item['name']?.toString() ?? 'Unknown',
-            imageUrl: item['cover']?.toString() ?? '',
-            backdropUrl: item['backdrop_path'] is List &&
-                    (item['backdrop_path'] as List).isNotEmpty
-                ? item['backdrop_path'][0]?.toString()
-                : null,
-            category: catName,
-            genre: _cleanGenre(catName),
-            rating: _parseRating(item['rating']),
-            year: _parseYear(item['releaseDate'] ?? item['last_modified']),
-            description: item['plot']?.toString(),
-            episodeCount: episodeCount,
-          );
-        }).toList();
+        return await compute(
+            _parseAndMapSeries, {'body': response.body, 'cats': cats});
       }
     } catch (e) {
       debugPrint('Error fetching series: $e');
@@ -440,13 +528,10 @@ class IptvService {
   static List<String> getLiveStreamUrlCandidates(
           String username, String password, String streamId) =>
       [
-        getLiveStreamUrlNoExt(username, password, streamId), // bare  — most compatible
-        getLiveStreamUrl(username, password, streamId),      // .m3u8 — HLS (most TVs)
-        getLiveStreamUrlTs(username, password, streamId),    // .ts   — MPEG-TS (old boxes)
-        // Additional HLS with different quality hint path (some Xtream variants)
+        getLiveStreamUrl(username, password, streamId),      // .m3u8 — HLS (fastest to start & smoothest)
+        getLiveStreamUrlTs(username, password, streamId),    // .ts   — MPEG-TS (direct stream)
+        getLiveStreamUrlNoExt(username, password, streamId), // bare URL fallback
         '$baseUrl/hls/$username/$password/$streamId.m3u8',
-        // Explicit bare fallback in case redirect is broken
-        '$baseUrl/live/$username/$password/$streamId',
       ];
 
   static String getMovieStreamUrl(

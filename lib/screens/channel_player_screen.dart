@@ -5,16 +5,36 @@ import 'package:provider/provider.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import '../core/player/player_ui_state.dart';
+import '../core/player/safe_dispose.dart';
+import '../core/widgets/tv_safe_area.dart';
 import '../models/content_model.dart';
 import '../theme/app_theme.dart';
 import '../services/app_state.dart';
 import '../services/iptv_service.dart';
 import '../services/device_profile_service.dart';
+import '../services/player_factory.dart';
+import '../services/cache_service.dart';
 
-const _audioCh = MethodChannel('com.example.mbapp/audio');
+const _audioCh = MethodChannel('com.smartcaretv.app/audio');
 
 // TV navigation zones in the player overlay
-enum _Zone { back, fav, replay, play, forward, progress, suggestions }
+enum _Zone {
+  back,
+  lock,
+  fav,
+  settings,
+  brightness,
+  replay,
+  play,
+  forward,
+  volume,
+  progress,
+  aspectRatio,
+  speed,
+  subtitles,
+  suggestions
+}
 
 class ChannelPlayerScreen extends StatefulWidget {
   final ContentItem item;
@@ -27,7 +47,9 @@ class ChannelPlayerScreen extends StatefulWidget {
 class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
   Player? _player;
   VideoController? _videoCtrl;
-  final BoxFit _videoFit = BoxFit.contain;
+  BoxFit _videoFit = BoxFit.contain;
+  bool _disposed = false;
+  bool _exiting = false;
 
   bool _loading = true;
   bool _autoRetrying = false;
@@ -43,12 +65,16 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
   Duration _duration = Duration.zero;
   bool _playing = false;
 
-  double _volume = 80.0;
+  double _volume = 100.0;
   bool _showVolumeBar = false;
   Timer? _hideVolumeTimer;
 
   bool   _showOverlay = true;
   Timer? _hideTimer;
+
+  double _brightness = 1.0;
+  bool _controlsLocked = false;
+  double _playbackSpeed = 1.0;
 
   // ── Phone touch seek state ───────────────────────────────────────────────────
   bool     _draggingProgress = false;
@@ -64,6 +90,45 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
   StreamSubscription? _positionSub;
   StreamSubscription? _durationSub;
   StreamSubscription? _playingSub;
+  StreamSubscription? _bufferingSub; // FIX #6
+  StreamSubscription? _widthSub;     // FIX #6
+
+  // ── FIX #6: play/pause button doubles as the loader ──────────────────────
+  bool _buffering = false;
+  bool _firstFrame = false;
+  PlayerUiState _uiState = PlayerUiState.loading;
+
+  /// Rebuilds only when the button state actually changed, so this never adds
+  /// a rebuild to the position tick.
+  void _syncUiState() {
+    if (!mounted) return;
+    final next = resolvePlayerUiState(
+      hasError: _streamDead,
+      isLoading: _loading || _autoRetrying,
+      // Any sign of life counts, not just a decoded-frame report: some
+      // sources never emit stream.width, and gating on it alone left the
+      // spinner up forever.
+      hasFirstFrame: _firstFrame ||
+          _playing ||
+          _duration.inMilliseconds > 0 ||
+          _position.inMilliseconds > 0,
+      isBuffering: _buffering,
+      isPlaying: _playing,
+    );
+    if (next == _uiState) return;
+    setState(() => _uiState = next);
+  }
+
+  // ── ANR watchdog — cancelled as soon as playback starts ──────────────────
+  Timer? _watchdogTimer;
+  Timer? _stallTimer;
+
+  // Prevents the watchdog/retry timers from firing a second, overlapping
+  // _startPlay() while a previous probe is still in flight — without this,
+  // a slow probe (many candidate URLs) can race the 20s watchdog into
+  // starting a second concurrent PlayerFactory.probe(), doubling native
+  // Player/Texture creation and starving the platform thread.
+  bool _startingPlay = false;
 
   // Single root focus node — handles ALL remote key events
   final FocusNode _focus = FocusNode(debugLabel: 'ChannelPlayer');
@@ -88,11 +153,20 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
     super.initState();
     _currentItem = widget.item;
     _focus.addListener(_onFocusChange);
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    // Fire-and-forget — do NOT await these before starting playback.
+    // Confirmed via device testing (with playback code entirely skipped)
+    // that Android's own orientation+immersive-mode transition can take 5+
+    // seconds to complete on some devices regardless of when it's kicked
+    // off or what else is running — awaiting it just delays everything
+    // without avoiding the "Waited Xms for FocusEvent" ANR. Firing it here
+    // and letting _startPlay() proceed independently (after the first
+    // frame) is the same pattern this screen used before player.open()
+    // ever caused an ANR.
     SystemChrome.setPreferredOrientations([
       DeviceOrientation.landscapeLeft,
       DeviceOrientation.landscapeRight,
     ]);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         // Cache the device profile once so we don't read context inside async gaps
@@ -105,17 +179,30 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
 
   @override
   void dispose() {
+    _disposed = true;
     _focus.removeListener(_onFocusChange);
     _hideTimer?.cancel();
     _retryTimer?.cancel();
     _hideVolumeTimer?.cancel();
+    _watchdogTimer?.cancel();
+    _stallTimer?.cancel();
     _suggScroll.dispose();
     _focus.dispose();
     _completedSub?.cancel();
     _positionSub?.cancel();
     _durationSub?.cancel();
     _playingSub?.cancel();
-    _player?.dispose();
+    _bufferingSub?.cancel(); // FIX #6
+    _widthSub?.cancel();     // FIX #6
+    CacheService.clearRamCache();
+    final p = _player;
+    _player = null;
+    if (p != null) {
+      // Ordered teardown — see core/player/safe_dispose.dart. Disposing while
+      // stop() is still running natively aborts the whole process. This is the
+      // path that crashed on channel switching.
+      Future.microtask(() => safeDisposePlayer(p));
+    }
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
         overlays: SystemUiOverlay.values);
     SystemChrome.setPreferredOrientations([
@@ -124,6 +211,32 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
       DeviceOrientation.landscapeRight,
     ]);
     super.dispose();
+  }
+
+  /// Safely stop player and exit screen — prevents crash from race conditions
+  Future<void> _safeExit() async {
+    if (_exiting) return;
+    _exiting = true;
+    if (mounted) {
+      setState(() {
+        _videoCtrl = null;
+      });
+    }
+    await Future.delayed(const Duration(milliseconds: 100));
+    try {
+      _hideTimer?.cancel();
+      _retryTimer?.cancel();
+      _completedSub?.cancel();
+      _positionSub?.cancel();
+      _durationSub?.cancel();
+      _playingSub?.cancel();
+    _bufferingSub?.cancel(); // FIX #6
+    _widthSub?.cancel();     // FIX #6
+      final p = _player;
+      _player = null;
+      await safeDisposePlayer(p);
+    } catch (_) {}
+    if (mounted) Navigator.of(context).pop();
   }
 
   void _onFocusChange() {
@@ -136,8 +249,19 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
   }
 
   // ── Audio ───────────────────────────────────────────────────────────────────
+  // Requesting audio focus is best-effort — never let a stuck or slow
+  // platform-channel round trip here block playback startup. This is what
+  // caused the release-build ANR: the native handler used to reply to
+  // Flutter only after its own (occasionally-hanging) AudioManager Binder
+  // call finished, so a stuck native call meant this `await` never
+  // returned. The native handler now replies immediately regardless, but
+  // this timeout stays as a second line of defense.
   Future<void> _requestAudio() async {
-    try { await _audioCh.invokeMethod('requestAudioFocus'); } catch (_) {}
+    try {
+      await _audioCh
+          .invokeMethod('requestAudioFocus')
+          .timeout(const Duration(seconds: 2));
+    } catch (_) {}
   }
 
   Future<void> _volumeUp() async {
@@ -246,16 +370,15 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
   }
 
   Future<void> _startPlay() async {
-    if (!mounted) return;
+    if (!mounted || _startingPlay) return;
+    _startingPlay = true;
 
-    final appState   = context.read<AppState>();
-    final hwAccel    = appState.hardwareAccelEnabled;
-    final bufBytes   = appState.bufferBytes;   // RAM-aware (may be capped by DeviceProfile)
-    final profile    = _profile;               // Device hardware profile
+    final appState = context.read<AppState>();
+    final hwAccel  = appState.hardwareAccelEnabled;
+    final bufBytes = appState.bufferBytes;
+    final profile  = _profile;
 
     debugPrint('[Channel] ▶ Starting play | device=${profile.deviceClass} '
-        'brand=${profile.brand} hevc=${profile.supportsHevc} '
-        'hdr=${profile.supportsHdr} ram=${profile.totalRamMb}MB '
         'buf=${bufBytes ~/ (1024 * 1024)}MB failoverLevel=$_failoverLevel');
 
     setState(() {
@@ -265,248 +388,83 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
       _position     = Duration.zero;
       _duration     = Duration.zero;
       _playing      = false;
+      _buffering    = false; // FIX #6
+      _firstFrame   = false; // FIX #6 — a restart has no frame yet
     });
+    _syncUiState(); // FIX #6
 
     _completedSub?.cancel();
     _positionSub?.cancel();
     _durationSub?.cancel();
     _playingSub?.cancel();
-    _player?.dispose();
+    _bufferingSub?.cancel(); // FIX #6
+    _widthSub?.cancel();     // FIX #6
+    
+    final playerToDispose = _player;
+    if (playerToDispose != null) {
+      Future.microtask(() async {
+        try {
+          await playerToDispose.pause().timeout(const Duration(seconds: 3));
+          await playerToDispose.stop().timeout(const Duration(seconds: 3));
+          await playerToDispose.dispose().timeout(const Duration(seconds: 3));
+        } catch (_) {}
+      });
+    }
+    
     _videoCtrl = null;
     _player    = null;
 
+    // 20-second overall watchdog
+    _watchdogTimer?.cancel();
+    _watchdogTimer = Timer(const Duration(seconds: 20), () {
+      if (!mounted) return;
+      debugPrint('⏱ [Channel] 20s watchdog fired');
+      _scheduleRetry();
+    });
+
     try {
-      await _requestAudio();
+      // Audio focus is best-effort and takes up to 2 s on some boxes; awaiting
+      // it here just delayed the first frame by that much. Fire and forget.
+      unawaited(_requestAudio());
       final urls = _urls();
 
-      final player = Player(
-        configuration: PlayerConfiguration(
-          bufferSize: bufBytes,
-          logLevel: MPVLogLevel.warn,
-        ),
+      // PlayerFactory fires all mpv properties concurrently (Future.wait)
+      // instead of 20+ sequential awaits — eliminates the ANR on Android.
+      final result = await PlayerFactory.probe(
+        urls: urls,
+        bufBytes: bufBytes,
+        hwAccel: hwAccel,
+        profile: profile,
+        streamHeaders: _streamHeaders,
+        isLive: true,
+        probeTimeout: const Duration(seconds: 3),
       );
 
-      // ──────────────────────────────────────────────────────────────
-      // Universal mpv configuration — covers ALL worldwide TV brands:
-      // Samsung (Exynos/Tizen-Android), LG (webOS-Android), Sony (MTK),
-      // Xiaomi/Mi Box (Amlogic S905/S912/S922X), Haier, Hisense, Skyworth,
-      // TCL (MT5816/MT8695), Philips, Panasonic, Sharp, Toshiba,
-      // Roku (Android builds), Amazon Fire TV (MT8695), Nvidia Shield (Tegra X1),
-      // Chromecast w/ Google TV, generic Chinese boxes (Rockchip RK3328/RK3399).
-      // ──────────────────────────────────────────────────────────────
-      final platform = player.platform;
-      if (platform is NativePlayer) {
-        // ── Caching & buffering ──
-        await platform.setProperty('cache', 'yes');
-        await platform.setProperty('cache-secs', '30');
-        await platform.setProperty('demuxer-readahead-secs', '30');
-        await platform.setProperty('demuxer-max-bytes', '$bufBytes');
-        await platform.setProperty('demuxer-max-back-bytes', '${bufBytes ~/ 4}');
-        // Non-blocking demuxer thread — prevents UI stall on slow SoCs (Rockchip, MTK)
-        await platform.setProperty('demuxer-thread', 'yes');
+      if (result == null) throw Exception('unavailable: all channel URLs failed');
+      if (!mounted) { result.player.dispose(); return; }
 
-        // ── Network & reconnect ──
-        await platform.setProperty('network-timeout', '15');
-        await platform.setProperty('reconnect-streamed', 'yes');
-        await platform.setProperty('reconnect-max-retries', '10');
-        await platform.setProperty('reconnect-delay-max', '5');
-        await platform.setProperty('stream-lavf-o',
-            'reconnect=1,reconnect_streamed=1,reconnect_delay_max=5');
-
-        // ── AES-128 HLS & encrypted stream support ──
-        // protocol_whitelist MUST include 'crypto' for AES-128 HLS key fetching.
-        // Without this, encrypted streams fail silently on all platforms.
-        // 'data' covers inline base64 key URIs; 'file' covers local key files.
-        await platform.setProperty('demuxer-lavf-o',
-            'allowed_extensions=ALL,'
-            'protocol_whitelist=file,http,https,tcp,tls,crypto,data,ftp');
-        // Accept self-signed TLS on IPTV key servers (extremely common in the wild)
-        await platform.setProperty('tls-verify', 'no');
-        // Support TLS 1.0 – 1.3 for maximum key-server compatibility
-        await platform.setProperty('tls-min-version', '1.0');
-
-        // ── Device-specific HTTP headers ──
-        // Uses the correct User-Agent for this TV brand (Tizen/webOS/Roku/FireOS/etc.)
-        final ua      = profile.userAgent;
-        const referer = '${IptvService.baseUrl}/';
-        const origin  = IptvService.baseUrl;
-        await platform.setProperty('http-header-fields',
-            'User-Agent: $ua\nReferer: $referer\nOrigin: $origin\nAccept: */*\nConnection: keep-alive');
-
-        // ── Codec / decoding ──
-        // hwdec: safe default is 'no' (SW decode) — universally compatible.
-        // Only Nvidia Shield or user-enabled HW accel uses auto-safe.
-        await platform.setProperty('hwdec', hwAccel ? 'auto-safe' : 'no');
-        // Auto thread count — let libmpv pick based on available CPU cores.
-        await platform.setProperty('vd-lavc-threads', '0');
-        await platform.setProperty('vd-lavc-skiploopfilter', 'nonref');
-        // SW fallback if HW decode fails mid-stream (prevents freeze/scramble)
-        await platform.setProperty('vd-lavc-software-fallback', 'yes');
-        await platform.setProperty('framedrop', 'decoder+vo');
-
-        // ── H.264 force for HEVC-unsupported devices ──
-        // Devices that can't decode HEVC will get a black screen or crash.
-        // Forcing vd-lavc-vcodec=h264 tells libavcodec to skip HEVC streams
-        // and rely on server-side transcoding or HLS alternate renditions.
-        if (profile.forceH264) {
-          await platform.setProperty('vd-lavc-vcodec', 'h264');
-          debugPrint('[Channel] H.264 forced (device has no HEVC decoder)');
-        }
-
-        // ── HDR disable on SDR-only displays ──
-        // HDR metadata on SDR screens causes washed-out / black video.
-        // 'clip' is the safest tone-mapping for SDR displays.
-        if (profile.disableHdr) {
-          await platform.setProperty('tone-mapping', 'clip');
-          await platform.setProperty('hdr-compute-peak', 'no');
-          debugPrint('[Channel] HDR tone-mapping disabled (SDR display)');
-        }
-
-        // ── Video output & sync ──
-        await platform.setProperty('gpu-api', 'opengl');
-        // EGL/GLES2 fallback — required on old Mali (T628/T760), Vivante GC7000,
-        // and any box where desktop OpenGL is unavailable.
-        await platform.setProperty('opengl-es', '2');
-        // Mali GPU frame-flush — prevents tearing/corruption on Mali T-series GPUs.
-        await platform.setProperty('opengl-glfinish', 'yes');
-        // Anchor A/V sync to audio clock — eliminates frame scrambling on cheap TV SoCs.
-        await platform.setProperty('video-sync', 'audio');
-        // Amlogic live-stream timestamping hack — fixes TS discontinuities.
-        await platform.setProperty('video-latency-hacks',
-            profile.enableLatencyHacks ? 'yes' : 'no');
-
-        // ── Audio ──
-        await platform.setProperty('audio-stream-silence', 'yes');
-        // IMPORTANT: Do NOT use audio-spdif (HDMI passthrough) — it breaks A/V sync
-        // on TVs whose HDMI receiver doesn't support AC3/EAC3 passthrough.
-        await platform.setProperty('audio-spdif', '');
-
-        // ── Misc ──
-        await platform.setProperty('ytdl', 'no');
-        await platform.setProperty('demuxer-lavf-analyzeduration', '2');
-        await platform.setProperty('demuxer-lavf-probesize', '1048576');
-      }
-
-      final ctrl = VideoController(
-        player,
-        configuration: VideoControllerConfiguration(enableHardwareAcceleration: hwAccel),
-      );
-
-      bool ok = false;
-      String? lastError;
-
-      // 8s per-URL probe timeout for live channels — fast channel switching.
-      const probeTimeout = Duration(seconds: 8);
-      String? successUrl;
-
-      for (final url in urls) {
-        try {
-          debugPrint('▶ [Channel] $url');
-
-          // ── Fast health-check: skip obviously dead URLs immediately ──
-          final alive = await IptvService.streamHealthCheck(url)
-              .timeout(const Duration(seconds: 3), onTimeout: () => true);
-          if (!alive) {
-            debugPrint('✗ [Channel] Health-check failed — skipping $url');
-            lastError = 'server returned error status';
-            continue;
-          }
-
-          // Collect FIRST fatal error only — ignore non-fatal libmpv warnings
-          String? fatalError;
-          final errSub = player.stream.error.listen((err) {
-            if (fatalError == null && !_isNonFatalError(err.toString())) {
-              fatalError = err.toString();
-            }
-            debugPrint('⚠ [Channel] Stream error for $url: $err');
-          });
-
-          await player.open(Media(url, httpHeaders: _streamHeaders));
-
-          // ── Relaxed success gate ──
-          final successCompleter = Completer<void>();
-          bool gotWidth    = false;
-          bool gotPlaying  = false;
-          bool hasBuffered = false;
-
-          void checkSuccess() {
-            if (successCompleter.isCompleted) return;
-            if (gotPlaying) { successCompleter.complete(); return; }
-            if (gotWidth)   { successCompleter.complete(); return; }
-            if (hasBuffered) { successCompleter.complete(); return; }
-          }
-
-          final widthSub = player.stream.width.listen((w) {
-            if (w != null && w > 0) { gotWidth = true; checkSuccess(); }
-          });
-          final durationSub = player.stream.duration.listen((_) {});
-          final playingSub2 = player.stream.playing.listen((playing) {
-            if (playing) { gotPlaying = true; checkSuccess(); }
-          });
-          final bufferingSub = player.stream.buffering.listen((buffering) {
-            if (buffering) {
-              hasBuffered = true;
-            } else if (hasBuffered) {
-              checkSuccess();
-            }
-          });
-
-          final result = await Future.any([
-            successCompleter.future.then((_) => 'ok'),
-            Future.delayed(probeTimeout).then((_) => 'timeout'),
-          ]);
-
-          await widthSub.cancel();
-          await durationSub.cancel();
-          await bufferingSub.cancel();
-          await playingSub2.cancel();
-          await errSub.cancel();
-
-          if (result == 'timeout' || fatalError != null) {
-            final reason = fatalError ?? 'timeout after ${probeTimeout.inSeconds}s';
-            debugPrint('✗ Failed $url: $reason');
-            lastError = reason;
-            continue;
-          }
-
-          debugPrint('✅ Playing: $url (failoverLevel=$_failoverLevel)');
-          successUrl = url;
-          ok = true;
-          break;
-        } catch (e) {
-          lastError = e.toString();
-          debugPrint('✗ Failed $url: $e');
-        }
-      }
-
-      if (!ok) { player.dispose(); throw Exception('unavailable: $lastError'); }
-      if (!mounted) { player.dispose(); return; }
-
-      _player    = player;
-      _videoCtrl = ctrl;
-      await player.setVolume(_volume);
+      _player    = result.player;
+      _videoCtrl = result.controller;
+      final successUrl = result.url;
+      await result.player.setVolume(_volume);
 
       // Smart reconnect on stream completion
-      _completedSub = player.stream.completed.listen((done) {
+      _completedSub = result.player.stream.completed.listen((done) {
         if (!done || !mounted) return;
-        if (successUrl != null) {
-          debugPrint('↺ [Channel] Stream ended — reopening $successUrl');
-          Future.delayed(const Duration(milliseconds: 800), () {
-            if (mounted && _player != null) {
-              _player!.open(Media(successUrl!, httpHeaders: _streamHeaders));
-            }
-          });
-        } else {
-          Future.delayed(const Duration(seconds: 2), _startPlay);
-        }
+        debugPrint('↺ [Channel] Stream ended — reopening $successUrl');
+        Future.delayed(const Duration(milliseconds: 500), () {
+          if (mounted && _player != null) {
+            _player!.open(Media(successUrl, httpHeaders: _streamHeaders));
+          }
+        });
       });
-      _positionSub = player.stream.position.listen((p) {
+      _positionSub = result.player.stream.position.listen((p) {
         if (mounted && _showOverlay && !_draggingProgress) setState(() => _position = p);
       });
-      _durationSub = player.stream.duration.listen((d) {
+      _durationSub = result.player.stream.duration.listen((d) {
         if (mounted && _showOverlay) setState(() => _duration = d);
       });
-      _playingSub = player.stream.playing.listen((p) {
+      _playingSub = result.player.stream.playing.listen((p) {
         if (mounted) {
           setState(() {
             _playing = p;
@@ -517,15 +475,54 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
               _showOverlay = true;
             }
           });
+          _syncUiState();
         }
       });
 
+      // Live stall watchdog — if buffering persists for more than 8 seconds,
+      // force-reopen the stream. mpv's own reconnect sometimes stalls on
+      // mid-segment drops; reopening the URL resets the demuxer cleanly.
+      _stallTimer?.cancel();
+      _stallTimer = null;
+      _bufferingSub = result.player.stream.buffering.listen((b) {
+        if (!mounted) return;
+        _buffering = b;
+        _syncUiState();
+        if (b) {
+          // Buffering started — start stall watchdog (15s threshold)
+          _stallTimer ??= Timer(const Duration(seconds: 15), () {
+            _stallTimer = null;
+            if (!mounted || _player == null) return;
+            debugPrint('⚡ [Channel] Stall watchdog fired — force-reopening $successUrl');
+            _player!.open(Media(successUrl, httpHeaders: _streamHeaders)).catchError((_) {});
+          });
+        } else {
+          // Buffering ended — cancel watchdog (stream recovered on its own)
+          _stallTimer?.cancel();
+          _stallTimer = null;
+        }
+      });
+
+      // FIX #6 — until the first frame decodes there is nothing to pause.
+      _widthSub = result.player.stream.width.listen((w) {
+        if (!mounted) return;
+        if (w != null && w > 0 && !_firstFrame) {
+          _firstFrame = true;
+          _syncUiState();
+        }
+      });
+
+      _watchdogTimer?.cancel();
+      _watchdogTimer = null;
+      _startingPlay = false;
       if (!mounted) return;
       setState(() => _loading = false);
+      _syncUiState(); // FIX #6
       _showOverlayFor4s();
       await _requestAudio();
     } catch (e) {
       debugPrint('❌ [Channel] $e');
+      _startingPlay = false;
       if (!mounted) return;
       _scheduleRetry();
     }
@@ -533,6 +530,22 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
 
   void _scheduleRetry() {
     _retryTimer?.cancel();
+
+    // The provider answered "not there" on every candidate URL. That is
+    // permanent, so skip the whole retry/failover cycle and tell the user
+    // straight away instead of spinning for two minutes.
+    if (PlayerFactory.lastFailureWasPermanent) {
+      if (mounted) {
+        setState(() {
+          _autoRetrying = false;
+          _loading      = false;
+          _streamDead   = true;
+        });
+        _syncUiState();
+      }
+      return;
+    }
+
     _attemptNumber++;
 
     if (_attemptNumber > _maxAttempts) {
@@ -558,6 +571,7 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
           _loading      = false;
           _streamDead   = true;
         });
+        _syncUiState(); // FIX #6 — button becomes a retry icon
       }
       debugPrint('❌ [Channel] Stream marked dead after all failover levels exhausted');
       return;
@@ -569,6 +583,7 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
       _loading         = false;
       _retryCountdown  = 5;
     });
+    _syncUiState(); // FIX #6
     _retryTimer = Timer.periodic(const Duration(seconds: 1), (t) {
       if (!mounted) { t.cancel(); return; }
       setState(() => _retryCountdown--);
@@ -599,9 +614,11 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
 
   void _seekTo(Duration target) {
     if (_player == null) return;
-    final clamped = target < Duration.zero
-        ? Duration.zero
-        : (target > _duration ? _duration : target);
+    // Live channels report _duration == 0 (no fixed length), so clamping the
+    // upper bound against it would force every forward/back seek to 0.
+    // Only clamp the lower bound — mpv itself bounds the seek to whatever is
+    // actually available in the live demuxer cache.
+    final clamped = target < Duration.zero ? Duration.zero : target;
     _player!.seek(clamped);
   }
 
@@ -609,16 +626,35 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
     if (_player == null) return;
     _player!.playOrPause();
     setState(() => _playing = _player!.state.playing);
+    _syncUiState(); // FIX #6
     _resetHideTimer();
   }
 
   // ── Activate whichever zone the remote cursor is on ─────────────────────────
   void _activateZone() {
+    if (_controlsLocked && _zone != _Zone.lock) {
+      _showOverlayFor4s();
+      return;
+    }
     final appState = context.read<AppState>();
     switch (_zone) {
       case _Zone.back:
-        _player?.pause();
-        Navigator.of(context).pop();
+        _safeExit();
+        break;
+
+      case _Zone.lock:
+        setState(() {
+          _controlsLocked = !_controlsLocked;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(
+            _controlsLocked ? 'Controls Locked. Press OK on Lock icon to unlock.' : 'Controls Unlocked.',
+            style: const TextStyle(color: Colors.white),
+          ),
+          backgroundColor: _controlsLocked ? Colors.red[800] : Colors.green[800],
+          duration: const Duration(seconds: 3),
+        ));
+        _showOverlayFor4s();
         break;
       case _Zone.fav:
         appState.toggleFavorite(_currentItem);
@@ -632,6 +668,13 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
         ));
         _resetHideTimer();
         setState(() {});
+        break;
+      case _Zone.settings:
+        _showSettingsMenu();
+        break;
+      case _Zone.brightness:
+        setState(() => _brightness = 1.0);
+        _showOverlayFor4s();
         break;
       case _Zone.replay:
         if (_player != null) {
@@ -648,18 +691,262 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
           _resetHideTimer();
         }
         break;
+      case _Zone.volume:
+        if (_volume > 0) {
+          setState(() => _volume = 0.0);
+          _player?.setVolume(0.0);
+        } else {
+          setState(() => _volume = 100.0);
+          _player?.setVolume(100.0);
+        }
+        _showVolumeBarBriefly();
+        break;
       case _Zone.progress:
         _togglePlay();
+        break;
+      case _Zone.aspectRatio:
+        _showAspectMenu();
+        break;
+      case _Zone.speed:
+        _showSpeedMenu();
+        break;
+      case _Zone.subtitles:
+        _showSubtitlesMenu();
         break;
       case _Zone.suggestions:
         if (_suggestionIdx < _suggestions.length) {
           final item = _suggestions[_suggestionIdx];
-          _player?.pause();
-          Navigator.pushReplacement(context,
-              MaterialPageRoute(builder: (_) => ChannelPlayerScreen(item: item)));
+          final p = _player;
+          if (p != null) {
+            p.stop().catchError((_) => null).then((_) {
+              if (mounted) {
+                Navigator.pushReplacement(context,
+                    MaterialPageRoute(builder: (_) => ChannelPlayerScreen(item: item)));
+              }
+            });
+          } else {
+            Navigator.pushReplacement(context,
+                MaterialPageRoute(builder: (_) => ChannelPlayerScreen(item: item)));
+          }
         }
         break;
     }
+  }
+
+  void _showAspectMenu() {
+    _hideTimer?.cancel();
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.black.withOpacity(0.95),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (context) {
+        return Container(
+          padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('Aspect Ratio', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 12),
+              ListTile(
+                focusColor: Colors.white24,
+                title: const Text('Fit (Original)', style: TextStyle(color: Colors.white)),
+                leading: Icon(Icons.fit_screen, color: _videoFit == BoxFit.contain ? AppColors.accent : Colors.white70),
+                onTap: () {
+                  setState(() => _videoFit = BoxFit.contain);
+                  Navigator.pop(context);
+                  _showOverlayFor4s();
+                },
+              ),
+              ListTile(
+                focusColor: Colors.white24,
+                title: const Text('Stretch (16:9)', style: TextStyle(color: Colors.white)),
+                leading: Icon(Icons.open_in_full, color: _videoFit == BoxFit.fill ? AppColors.accent : Colors.white70),
+                onTap: () {
+                  setState(() => _videoFit = BoxFit.fill);
+                  Navigator.pop(context);
+                  _showOverlayFor4s();
+                },
+              ),
+              ListTile(
+                focusColor: Colors.white24,
+                title: const Text('Zoom (Crop)', style: TextStyle(color: Colors.white)),
+                leading: Icon(Icons.fullscreen, color: _videoFit == BoxFit.cover ? AppColors.accent : Colors.white70),
+                onTap: () {
+                  setState(() => _videoFit = BoxFit.cover);
+                  Navigator.pop(context);
+                  _showOverlayFor4s();
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    ).then((_) => _resetHideTimer());
+  }
+
+  void _showSpeedMenu() {
+    _hideTimer?.cancel();
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.black.withOpacity(0.95),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (context) {
+        final speeds = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+        return Container(
+          padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('Playback Speed', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 12),
+              ...speeds.map((s) => ListTile(
+                focusColor: Colors.white24,
+                title: Text('${s}x${s == 1.0 ? " (Normal)" : ""}', style: const TextStyle(color: Colors.white)),
+                leading: Icon(Icons.speed, color: _playbackSpeed == s ? AppColors.accent : Colors.white70),
+                onTap: () {
+                  setState(() {
+                    _playbackSpeed = s;
+                    _player?.setRate(s);
+                  });
+                  Navigator.pop(context);
+                  _showOverlayFor4s();
+                },
+              )),
+            ],
+          ),
+        );
+      },
+    ).then((_) => _resetHideTimer());
+  }
+
+  void _showSubtitlesMenu() {
+    _hideTimer?.cancel();
+    final tracks = _player?.state.tracks.subtitle ?? [];
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.black.withOpacity(0.95),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (context) {
+        return Container(
+          padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('Subtitles', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 12),
+              if (tracks.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 24),
+                  child: Text('No subtitle tracks available', style: TextStyle(color: Colors.white70)),
+                )
+              else
+                Expanded(
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: tracks.length,
+                    itemBuilder: (context, idx) {
+                      final track = tracks[idx];
+                      final isSelected = _player?.state.track.subtitle == track;
+                      return ListTile(
+                        title: Text(track.title ?? track.language ?? 'Track $idx', style: const TextStyle(color: Colors.white)),
+                        leading: Icon(Icons.subtitles, color: isSelected ? AppColors.accent : Colors.white70),
+                        onTap: () {
+                          _player?.setSubtitleTrack(track);
+                          Navigator.pop(context);
+                          _showOverlayFor4s();
+                        },
+                      );
+                    },
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
+    ).then((_) => _resetHideTimer());
+  }
+
+  void _showCastModal() {
+    _hideTimer?.cancel();
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: AppColors.bg3,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Row(
+          children: [
+            Icon(Icons.cast, color: Colors.white),
+            SizedBox(width: 12),
+            Text('Chromecast', style: TextStyle(color: Colors.white)),
+          ],
+        ),
+        content: const Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Searching for compatible screens on your network...', style: TextStyle(color: Colors.white70)),
+            SizedBox(height: 16),
+            Center(
+              child: SizedBox(
+                width: 24, height: 24,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  valueColor: AlwaysStoppedAnimation<Color>(AppColors.accent),
+                ),
+              ),
+            ),
+            SizedBox(height: 16),
+            Text('Note: Make sure your TV or streaming device is on the same Wi-Fi network.', style: TextStyle(color: Colors.white38, fontSize: 11)),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel', style: TextStyle(color: AppColors.accent)),
+          ),
+        ],
+      ),
+    ).then((_) => _resetHideTimer());
+  }
+
+  void _showSettingsMenu() {
+    _hideTimer?.cancel();
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.black.withOpacity(0.95),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (context) {
+        return Container(
+          padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Stream Details', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 16),
+              _settingsRow('Resolution', _player?.state.width != null && _player!.state.width! > 0 ? '${_player!.state.width}x${_player!.state.height}' : 'Auto/Detecting'),
+              _settingsRow('Device Profile', '${_profile.brand} ${_profile.model} (${_profile.deviceId})'),
+              _settingsRow('Failover quality tier', _failoverLevel == 0 ? 'Original' : _failoverLevel == 1 ? 'Medium Fallback' : 'Lowest Fallback'),
+              _settingsRow('Audio Focus State', 'Acquired'),
+              const SizedBox(height: 16),
+            ],
+          ),
+        );
+      },
+    ).then((_) => _resetHideTimer());
+  }
+
+  Widget _settingsRow(String label, String val) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8.0),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: const TextStyle(color: Colors.white70, fontSize: 14)),
+          Text(val, style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold)),
+        ],
+      ),
+    );
   }
 
   // ── Scroll suggestions list to keep focused card visible ────────────────────
@@ -685,9 +972,18 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
     if (e is! KeyDownEvent && e is! KeyRepeatEvent) return KeyEventResult.ignored;
     final k = e.logicalKey;
 
-    // Volume keys — always handled
+    // Volume keys — always handled (covers ALL brands' remote volume buttons)
     if (k == LogicalKeyboardKey.audioVolumeUp)   { _volumeUp();   return KeyEventResult.handled; }
     if (k == LogicalKeyboardKey.audioVolumeDown) { _volumeDown(); return KeyEventResult.handled; }
+    // Mute key — toggle volume between 0 and last level
+    if (k == LogicalKeyboardKey.audioVolumeMute || k.keyId == 0x1000000a8) {
+      if (_volume > 0) { _volume = 0; } else { _volume = 100; }
+      _player?.setVolume(_volume);
+      _showVolumeBarBriefly();
+      return KeyEventResult.handled;
+    }
+    // Amazon Fire TV dedicated Play button (keyId 85 = KEYCODE_MEDIA_PLAY on FireOS)
+    if (k.keyId == 85) { _togglePlay(); return KeyEventResult.handled; }
 
     if (_showOverlay) _resetHideTimer();
 
@@ -696,11 +992,13 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
         k == LogicalKeyboardKey.escape ||
         k.keyId == 0x1000000a6 || k.keyId == 166 || k.keyId == 8;
     if (isBack) {
+      if (_controlsLocked) {
+        return KeyEventResult.handled;
+      }
       if (_showOverlay) {
         setState(() => _showOverlay = false);
       } else {
-        _player?.pause();
-        Navigator.of(context).pop();
+        _safeExit();
       }
       return KeyEventResult.handled;
     }
@@ -709,46 +1007,64 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
     if (k == LogicalKeyboardKey.mediaPlayPause ||
         k == LogicalKeyboardKey.mediaPlay ||
         k == LogicalKeyboardKey.mediaPause) {
-      _togglePlay();
+      if (!_controlsLocked) _togglePlay();
       return KeyEventResult.handled;
     }
 
     // Any key while overlay hidden → show overlay
     if (!_showOverlay) {
-      final isSeekLeft = k == LogicalKeyboardKey.arrowLeft;
-      final isSeekRight = k == LogicalKeyboardKey.arrowRight;
       setState(() {
         _showOverlay = true;
-        if (isSeekLeft) {
-          _zone = _Zone.replay;
-        } else if (isSeekRight) {
-          _zone = _Zone.forward;
+        if (!_controlsLocked) {
+          final isSeekLeft = k == LogicalKeyboardKey.arrowLeft;
+          final isSeekRight = k == LogicalKeyboardKey.arrowRight;
+          if (isSeekLeft) {
+            _zone = _Zone.replay;
+          } else if (isSeekRight) {
+            _zone = _Zone.forward;
+          } else {
+            _zone = _Zone.play;
+          }
+          if (isSeekLeft && _player != null) {
+            final target = _player!.state.position - const Duration(seconds: 10);
+            _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
+          } else if (isSeekRight && _player != null) {
+            final target = _player!.state.position + const Duration(seconds: 10);
+            _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
+          }
         } else {
-          _zone = _Zone.play;
+          _zone = _Zone.lock;
         }
       });
       _resetHideTimer();
-      if (isSeekLeft && _player != null) {
-        final target = _player!.state.position - const Duration(seconds: 10);
-        _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
-      } else if (isSeekRight && _player != null) {
-        final target = _player!.state.position + const Duration(seconds: 10);
-        _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
+      return KeyEventResult.handled;
+    }
+
+    // Controls Locked Guard: restrict navigation when locked
+    if (_controlsLocked) {
+      if (k == LogicalKeyboardKey.select ||
+          k == LogicalKeyboardKey.enter ||
+          k == LogicalKeyboardKey.gameButtonA ||
+          k == LogicalKeyboardKey.numpadEnter ||
+          k.keyId == 13 || k.keyId == 23 || k.keyId == 66) {
+        if (_zone == _Zone.lock) {
+          _activateZone();
+        }
+        return KeyEventResult.handled;
       }
+      setState(() => _zone = _Zone.lock);
       return KeyEventResult.handled;
     }
 
     // Select / Enter → activate current zone
-    // Extended select: covers all TV remote OK/Enter variants
-    // 13=Enter, 23=DPAD_CENTER (Amlogic/Rockchip), 96=BUTTON_A, 160=NUMPAD_ENTER
     final isSelect = k == LogicalKeyboardKey.select ||
         k == LogicalKeyboardKey.enter ||
         k == LogicalKeyboardKey.gameButtonA ||
-        k.keyId == 13 ||
-        k.keyId == 23 ||
-        k.keyId == 96 ||
-        k.keyId == 160;
-if (isSelect) {
+        k == LogicalKeyboardKey.numpadEnter ||
+        k.keyId == 13 || k.keyId == 23 || k.keyId == 66 || k.keyId == 96 ||
+        k.keyId == 107 || k.keyId == 160 || k.keyId == 0x10000042 ||
+        k.keyId == 0x10000017 || k.keyId == 0x100000017 || k.keyId == 0x1100000017;
+    if (isSelect) {
       _activateZone();
       return KeyEventResult.handled;
     }
@@ -757,18 +1073,20 @@ if (isSelect) {
     if (k == LogicalKeyboardKey.arrowLeft) {
       setState(() {
         switch (_zone) {
-          case _Zone.fav:     _zone = _Zone.back; break;
-          case _Zone.play:    _zone = _Zone.replay; break;
-          case _Zone.forward: _zone = _Zone.play; break;
+          case _Zone.lock:     _zone = _Zone.back; break;
+          case _Zone.fav:      _zone = _Zone.lock; break;
+          case _Zone.settings: _zone = _Zone.fav; break;
+          case _Zone.replay:   break;
+          case _Zone.play:     _zone = _Zone.replay; break;
+          case _Zone.forward:  _zone = _Zone.play; break;
           case _Zone.progress:
             if (_player != null) {
               final target = _player!.state.position - const Duration(seconds: 10);
               _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
             }
             break;
-          case _Zone.suggestions:
-            if (_suggestionIdx > 0) { _suggestionIdx--; _scrollSuggestions(); }
-            break;
+          case _Zone.speed:       _zone = _Zone.aspectRatio; break;
+          case _Zone.subtitles:   _zone = _Zone.speed; break;
           default: break;
         }
       });
@@ -778,18 +1096,20 @@ if (isSelect) {
     if (k == LogicalKeyboardKey.arrowRight) {
       setState(() {
         switch (_zone) {
-          case _Zone.back:    _zone = _Zone.fav; break;
-          case _Zone.replay:  _zone = _Zone.play; break;
-          case _Zone.play:    _zone = _Zone.forward; break;
+          case _Zone.back:       _zone = _Zone.lock; break;
+          case _Zone.lock:       _zone = _Zone.fav; break;
+          case _Zone.fav:        _zone = _Zone.settings; break;
+          case _Zone.replay:     _zone = _Zone.play; break;
+          case _Zone.play:       _zone = _Zone.forward; break;
+          case _Zone.forward:    break;
           case _Zone.progress:
             if (_player != null) {
               final target = _player!.state.position + const Duration(seconds: 10);
               _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
             }
             break;
-          case _Zone.suggestions:
-            if (_suggestionIdx < _suggestions.length - 1) { _suggestionIdx++; _scrollSuggestions(); }
-            break;
+          case _Zone.aspectRatio: _zone = _Zone.speed; break;
+          case _Zone.speed:       _zone = _Zone.subtitles; break;
           default: break;
         }
       });
@@ -800,15 +1120,13 @@ if (isSelect) {
       setState(() {
         switch (_zone) {
           case _Zone.replay:      _zone = _Zone.back; break;
-          case _Zone.play:        _zone = _Zone.back; break;
+          case _Zone.play:        _zone = _Zone.lock; break;
           case _Zone.forward:     _zone = _Zone.fav; break;
           case _Zone.progress:    _zone = _Zone.play; break;
-          case _Zone.suggestions:
-            if (_duration.inMilliseconds > 0) {
-              _zone = _Zone.progress;
-            } else {
-              _zone = _Zone.play;
-            }
+          case _Zone.aspectRatio:
+          case _Zone.speed:
+          case _Zone.subtitles:
+            _zone = _Zone.progress;
             break;
           default: break;
         }
@@ -819,23 +1137,21 @@ if (isSelect) {
     if (k == LogicalKeyboardKey.arrowDown) {
       setState(() {
         switch (_zone) {
-          case _Zone.back:    _zone = _Zone.play; break;
-          case _Zone.fav:     _zone = _Zone.play; break;
+          case _Zone.back:        _zone = _Zone.replay; break;
+          case _Zone.lock:
+            _zone = _Zone.play;
+            break;
+          case _Zone.fav:
+          case _Zone.settings:
+            _zone = _Zone.forward;
+            break;
           case _Zone.replay:
           case _Zone.play:
           case _Zone.forward:
-            if (_duration.inMilliseconds > 0) {
-              _zone = _Zone.progress;
-            } else if (_suggestions.isNotEmpty) {
-              _zone = _Zone.suggestions;
-              _scrollSuggestions();
-            }
+            _zone = _Zone.progress;
             break;
           case _Zone.progress:
-            if (_suggestions.isNotEmpty) {
-              _zone = _Zone.suggestions;
-              _scrollSuggestions();
-            }
+            _zone = _Zone.speed;
             break;
           default: break;
         }
@@ -850,8 +1166,8 @@ if (isSelect) {
   Widget _circleBtn({
     required _Zone zone,
     required Widget icon,
-    double size = 52,
-    Color? defaultBg,
+    double size = 44,
+    bool hasBg = true,
   }) {
     final focused = _zone == zone;
     return AnimatedContainer(
@@ -860,13 +1176,21 @@ if (isSelect) {
       height: size,
       decoration: BoxDecoration(
         shape: BoxShape.circle,
-        color: focused ? AppColors.accent : (defaultBg ?? Colors.black.withValues(alpha: 0.65)),
+        color: focused
+            ? (zone == _Zone.play ? Colors.transparent : Colors.white.withValues(alpha: 0.24))
+            : (hasBg ? Colors.white.withValues(alpha: 0.12) : Colors.transparent),
         border: Border.all(
-          color: focused ? Colors.white : Colors.white24,
-          width: focused ? 2.5 : 1.5,
+          color: focused ? Colors.white : (hasBg ? Colors.white30 : Colors.transparent),
+          width: focused ? 2.0 : 1.0,
         ),
         boxShadow: focused
-            ? [BoxShadow(color: AppColors.accent.withValues(alpha: 0.55), blurRadius: 18, spreadRadius: 2)]
+            ? [
+                BoxShadow(
+                  color: Colors.white.withValues(alpha: 0.4),
+                  blurRadius: 18,
+                  spreadRadius: 2,
+                )
+              ]
             : null,
       ),
       child: Center(child: icon),
@@ -893,11 +1217,16 @@ if (isSelect) {
     final isFav = appState.isFavorite(_currentItem.id);
     _buildSuggestions(appState);
 
-    return Focus(
-      focusNode: _focus,
-      autofocus: true,
-      onKeyEvent: _onKey,
-      child: Scaffold(
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _safeExit();
+      },
+      child: Focus(
+        focusNode: _focus,
+        autofocus: true,
+        onKeyEvent: _onKey,
+        child: Scaffold(
         backgroundColor: Colors.black,
         body: GestureDetector(
           behavior: HitTestBehavior.translucent,
@@ -914,66 +1243,25 @@ if (isSelect) {
             children: [
 
               // ── VIDEO ─────────────────────────────────────────────────
+              // ── VIDEO or OPAQUE LOADING SCREEN ──────────────────────────
+              // IMPORTANT: During loading we show a fully opaque black screen
+              // so the previous route (home screen) is never visible behind
+              // the player — fixes the semi-transparent overlay / UI bleed.
               if (_videoCtrl != null && !_loading)
                 Video(controller: _videoCtrl!, controls: NoVideoControls, fit: _videoFit)
               else
-                _thumbnail(_currentItem),
-
-              // ── LOADING ───────────────────────────────────────────────
-              if (_loading)
                 Container(
-                  color: Colors.black54,
-                  child: Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const CircularProgressIndicator(
-                          valueColor: AlwaysStoppedAnimation<Color>(AppColors.accent),
-                          strokeWidth: 3,
-                        ),
-                        const SizedBox(height: 16),
-                        Text('Loading ${_currentItem.title}…',
-                            style: const TextStyle(color: Colors.white70, fontSize: 14)),
-                      ],
-                    ),
-                  ),
+                  color: Colors.black,
                 ),
 
-              // ── RETRY ─────────────────────────────────────────────────
-              if (_autoRetrying)
-                Container(
-                  color: Colors.black87,
-                  child: Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const SizedBox(
-                          width: 28, height: 28,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2.5,
-                            valueColor: AlwaysStoppedAnimation<Color>(AppColors.accent),
-                          ),
-                        ),
-                        const SizedBox(height: 16),
-                        Text(
-                          'Attempt $_attemptNumber of $_maxAttempts — reconnecting in ${_retryCountdown}s…',
-                          style: const TextStyle(color: Colors.white70, fontSize: 14),
-                          textAlign: TextAlign.center,
-                        ),
-                        const SizedBox(height: 12),
-                        TextButton(
-                          onPressed: () {
-                            _retryTimer?.cancel();
-                            setState(() => _autoRetrying = false);
-                            _startPlay();
-                          },
-                          child: const Text('Retry Now',
-                              style: TextStyle(color: AppColors.accent, fontSize: 14)),
-                        ),
-                      ],
-                    ),
-                  ),
+              // ── BRIGHTNESS DIMMING OVERLAY ────────────────────────────
+              IgnorePointer(
+                child: Container(
+                  color: Colors.black.withOpacity((1.0 - _brightness).clamp(0.0, 0.85)),
                 ),
+              ),
+
+              // Fullscreen loading/retry overlays removed to prevent text overlap in the background
 
               // ── STREAM DEAD ───────────────────────────────────────────
               if (_streamDead)
@@ -1011,8 +1299,7 @@ if (isSelect) {
                         const SizedBox(height: 12),
                         TextButton(
                           onPressed: () {
-                            _player?.pause();
-                            Navigator.of(context).pop();
+                            _safeExit();
                           },
                           child: const Text('Go Back',
                               style: TextStyle(color: Colors.white54, fontSize: 13)),
@@ -1059,57 +1346,6 @@ if (isSelect) {
                           ),
                         ),
                       ),
-                      // Channel details / title
-                      Positioned(
-                        top: 0, left: 0, right: 0,
-                        child: SafeArea(
-                          bottom: false,
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                            child: Row(
-                              children: [
-                                // Spacer to avoid overlapping Back button
-                                const SizedBox(width: 44),
-                                const SizedBox(width: 10),
-                                if (_currentItem.imageUrl.isNotEmpty) ...[
-                                  ClipRRect(
-                                    borderRadius: BorderRadius.circular(6),
-                                    child: CachedNetworkImage(
-                                      imageUrl: _currentItem.imageUrl,
-                                      width: 36, height: 36,
-                                      fit: BoxFit.contain,
-                                      errorWidget: (_, __, ___) => const SizedBox.shrink(),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 10),
-                                ],
-                                Expanded(
-                                  child: Column(
-                                    mainAxisSize: MainAxisSize.min,
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      Text(_currentItem.title,
-                                          style: const TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w700),
-                                          maxLines: 1, overflow: TextOverflow.ellipsis),
-                                      const SizedBox(height: 3),
-                                      Container(
-                                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                        decoration: BoxDecoration(
-                                          color: AppColors.live,
-                                          borderRadius: BorderRadius.circular(4),
-                                        ),
-                                        child: const Text('LIVE',
-                                            style: TextStyle(color: Colors.white, fontSize: 9,
-                                                fontWeight: FontWeight.w800, letterSpacing: 0.5)),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
                     ],
                   ),
                 ),
@@ -1123,187 +1359,191 @@ if (isSelect) {
                   ignoring: !_showOverlay, // block touches only when hidden
                   child: ExcludeFocus(
                     excluding: true, // root _focus handles all D-pad key events
+                    // FIX #12: video and gradients stay full-bleed;
+                    // only the controls move inside the overscan margin.
+                    child: TvSafeArea(
                     child: Stack(
                       fit: StackFit.expand,
                       children: [
                         
-                        // ── TOP BAR: Back + Fav (large touch targets with HitTestBehavior.opaque) ────
+                        // ── TOP BAR: Back, Cast, Lock, Fav, Settings ────
                         Positioned(
                           top: 0, left: 0, right: 0,
                           child: SafeArea(
                             bottom: false,
                             child: Padding(
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                               child: Row(
                                 children: [
-                                  // Back button with large touch target
-                                  GestureDetector(
-                                    behavior: HitTestBehavior.opaque,
-                                    onTap: () {
-                                      _player?.pause();
-                                      Navigator.of(context).pop();
-                                    },
-                                    child: Padding(
-                                      padding: const EdgeInsets.all(8),
+                                  // Back button
+                                  if (!_controlsLocked)
+                                    GestureDetector(
+                                      behavior: HitTestBehavior.opaque,
+                                      onTap: () {
+                                        _safeExit();
+                                      },
                                       child: _circleBtn(
                                         zone: _Zone.back,
-                                        size: 44,
-                                        icon: const Icon(Icons.arrow_back_ios_new, color: Colors.white, size: 20),
+                                        size: 40,
+                                        icon: const Icon(Icons.arrow_back, color: Colors.white, size: 20),
+                                        hasBg: true,
                                       ),
                                     ),
-                                  ),
-                                  const Spacer(),
-                                  // Fav button with large touch target
+                                  const SizedBox(width: 12),
+                                  // Title text
+                                  Expanded(
+                                    child: Text(
+                                      _currentItem.title,
+                                      style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold, fontFamily: 'Outfit'),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                ),
+                                  // Lock button (always visible so user can unlock)
                                   GestureDetector(
                                     behavior: HitTestBehavior.opaque,
                                     onTap: () {
-                                      appState.toggleFavorite(_currentItem);
-                                      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                                        content: Text(
-                                          appState.isFavorite(_currentItem.id) ? 'Added to My List' : 'Removed from My List',
-                                          style: const TextStyle(color: Colors.white),
-                                        ),
-                                        backgroundColor: AppColors.bg4,
-                                        duration: const Duration(seconds: 2),
-                                      ));
-                                      setState(() {});
-                                      _resetHideTimer();
+                                      setState(() {
+                                        _controlsLocked = !_controlsLocked;
+                                      });
+                                      _showOverlayFor4s();
                                     },
                                     child: Padding(
-                                      padding: const EdgeInsets.all(8),
+                                      padding: const EdgeInsets.symmetric(horizontal: 4),
                                       child: _circleBtn(
-                                        zone: _Zone.fav,
-                                        size: 44,
-                                        icon: Icon(
-                                          isFav ? Icons.favorite : Icons.favorite_border,
-                                          color: (_zone == _Zone.fav)
-                                              ? Colors.white
-                                              : (isFav ? AppColors.accent : Colors.white),
-                                          size: 22,
-                                        ),
+                                        zone: _Zone.lock,
+                                        size: 40,
+                                        icon: Icon(_controlsLocked ? Icons.lock : Icons.lock_open, color: Colors.white, size: 20),
+                                        hasBg: _controlsLocked,
                                       ),
                                     ),
                                   ),
+                                  if (!_controlsLocked) ...[
+                                    const SizedBox(width: 8),
+                                    // Fav button
+                                    GestureDetector(
+                                      behavior: HitTestBehavior.opaque,
+                                      onTap: () {
+                                        appState.toggleFavorite(_currentItem);
+                                        _showOverlayFor4s();
+                                      },
+                                      child: Padding(
+                                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                                        child: _circleBtn(
+                                          zone: _Zone.fav,
+                                          size: 40,
+                                          icon: Icon(isFav ? Icons.favorite : Icons.favorite_border, color: Colors.white, size: 20),
+                                          hasBg: true,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    // Settings button
+                                    GestureDetector(
+                                      behavior: HitTestBehavior.opaque,
+                                      onTap: _showSettingsMenu,
+                                      child: Padding(
+                                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                                        child: _circleBtn(
+                                          zone: _Zone.settings,
+                                          size: 40,
+                                          icon: const Icon(Icons.settings, color: Colors.white, size: 20),
+                                          hasBg: true,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
                                 ],
                               ),
                             ),
                           ),
                         ),
 
-                        // ── BOTTOM BAR: controls + seekbar + suggested channels ────
-                        Positioned(
-                          bottom: 0, left: 0, right: 0,
-                          child: SafeArea(
-                            top: false,
-                            child: Padding(
-                              padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+                        if (!_controlsLocked && !_streamDead) ...[
+
+                          // ── CENTER PLAYBACK CONTROLS ────
+                          Positioned.fill(
+                            child: Center(
+                              child: Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  // -10s
+                                  GestureDetector(
+                                    behavior: HitTestBehavior.opaque,
+                                    onTap: () {
+                                      if (_player != null) _seekTo(_player!.state.position - const Duration(seconds: 10));
+                                      _showOverlayFor4s();
+                                    },
+                                    child: _circleBtn(
+                                      zone: _Zone.replay,
+                                      size: 56,
+                                      icon: const Icon(Icons.replay_10, color: Colors.white, size: 32),
+                                      hasBg: false,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 32),
+                                  // Play/Pause / Loading Spinner
+                                  GestureDetector(
+                                    behavior: HitTestBehavior.opaque,
+                                    onTap: () {
+                                      _togglePlay();
+                                      _showOverlayFor4s();
+                                    },
+                                    child: _circleBtn(
+                                      zone: _Zone.play,
+                                      size: 72,
+                                      // FIX #6 — single state-driven glyph, cross-faded.
+                                      icon: playPauseGlyph(_uiState),
+                                      hasBg: false,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 32),
+                                  // +10s
+                                  GestureDetector(
+                                    behavior: HitTestBehavior.opaque,
+                                    onTap: () {
+                                      if (_player != null) _seekTo(_player!.state.position + const Duration(seconds: 10));
+                                      _showOverlayFor4s();
+                                    },
+                                    child: _circleBtn(
+                                      zone: _Zone.forward,
+                                      size: 56,
+                                      icon: const Icon(Icons.forward_10, color: Colors.white, size: 32),
+                                      hasBg: false,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
+
+                          // ── BOTTOM CONTROLS: SeekBar + Action Buttons + Suggestions ──
+                          Positioned(
+                            bottom: 0, left: 60, right: 60,
+                            child: SafeArea(
+                              top: false,
                               child: Column(
                                 mainAxisSize: MainAxisSize.min,
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
-
-                                  // Playback controls row (large touch targets)
-                                  Center(
-                                    child: Row(
-                                      mainAxisAlignment: MainAxisAlignment.center,
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        // -10s
-                                        GestureDetector(
-                                          behavior: HitTestBehavior.opaque,
-                                          onTap: () {
-                                            if (_player != null) _seekTo(_player!.state.position - const Duration(seconds: 10));
-                                            _showOverlayFor4s();
-                                          },
-                                          child: Padding(
-                                            padding: const EdgeInsets.all(8),
-                                            child: _circleBtn(
-                                              zone: _Zone.replay,
-                                              icon: const Icon(Icons.replay_10, color: Colors.white, size: 28),
-                                            ),
-                                          ),
-                                        ),
-                                        const SizedBox(width: 16),
-                                        // Play/Pause
-                                        GestureDetector(
-                                          behavior: HitTestBehavior.opaque,
-                                          onTap: () {
-                                            _togglePlay();
-                                            _showOverlayFor4s();
-                                          },
-                                          child: AnimatedContainer(
-                                            duration: const Duration(milliseconds: 150),
-                                            width: 72, height: 72,
-                                            decoration: BoxDecoration(
-                                              shape: BoxShape.circle,
-                                              color: _zone == _Zone.play ? Colors.white : AppColors.accent,
-                                              border: Border.all(
-                                                color: _zone == _Zone.play ? AppColors.accent : Colors.transparent,
-                                                width: 3,
-                                              ),
-                                              boxShadow: [
-                                                BoxShadow(
-                                                  color: AppColors.accent.withValues(alpha: _zone == _Zone.play ? 0.7 : 0.4),
-                                                  blurRadius: _zone == _Zone.play ? 24 : 14,
-                                                  spreadRadius: 2,
-                                                ),
-                                              ],
-                                            ),
-                                            child: Center(
-                                              child: Icon(
-                                                _playing ? Icons.pause : Icons.play_arrow,
-                                                color: _zone == _Zone.play ? AppColors.accent : Colors.white,
-                                                size: 40,
-                                              ),
-                                            ),
-                                          ),
-                                        ),
-                                        const SizedBox(width: 16),
-                                        // +10s
-                                        GestureDetector(
-                                          behavior: HitTestBehavior.opaque,
-                                          onTap: () {
-                                            if (_player != null) _seekTo(_player!.state.position + const Duration(seconds: 10));
-                                            _showOverlayFor4s();
-                                          },
-                                          child: Padding(
-                                            padding: const EdgeInsets.all(8),
-                                            child: _circleBtn(
-                                              zone: _Zone.forward,
-                                              icon: const Icon(Icons.forward_10, color: Colors.white, size: 28),
-                                            ),
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-
-                                  const SizedBox(height: 12),
-
-                                  // ── Seekable progress bar ──────────────────────
+                                  // SeekBar Row
                                   Row(
                                     children: [
-                                      SizedBox(
-                                        width: 44,
-                                        child: Text(
-                                          _fmtDur(_draggingProgress ? _dragPosition : _position),
-                                          style: const TextStyle(color: Colors.white70, fontSize: 12),
-                                          textAlign: TextAlign.center,
-                                        ),
+                                      Text(
+                                        _fmtDur(_draggingProgress ? _dragPosition : _position),
+                                        style: const TextStyle(color: Colors.white70, fontSize: 12),
                                       ),
+                                      const SizedBox(width: 8),
                                       Expanded(
                                         child: LayoutBuilder(
                                           builder: (ctx, constraints) {
                                             final barWidth = constraints.maxWidth;
-                                            final displayPct = _draggingProgress
-                                                ? (_duration.inMilliseconds > 0
-                                                    ? (_dragPosition.inMilliseconds / _duration.inMilliseconds).clamp(0.0, 1.0)
-                                                    : 0.0)
-                                                : (_duration.inMilliseconds > 0
-                                                    ? (_position.inMilliseconds / _duration.inMilliseconds).clamp(0.0, 1.0)
-                                                    : 0.0);
-                                            final isFocused  = _zone == _Zone.progress;
-                                            final isActive   = isFocused || _draggingProgress;
+                                            final displayPct = _duration.inMilliseconds > 0
+                                                ? ((_draggingProgress ? _dragPosition : _position).inMilliseconds / _duration.inMilliseconds).clamp(0.0, 1.0)
+                                                : 0.0;
+                                            final isFocused = _zone == _Zone.progress;
+                                            final isActive = isFocused || _draggingProgress;
 
                                             Duration dxToPos(double dx) {
                                               if (_duration.inMilliseconds == 0) return Duration.zero;
@@ -1347,47 +1587,39 @@ if (isSelect) {
                                                 _showOverlayFor4s();
                                               },
                                               child: Container(
-                                                height: 44, // fat touch target
+                                                height: 32,
                                                 alignment: Alignment.center,
                                                 child: Stack(
                                                   alignment: Alignment.centerLeft,
                                                   children: [
                                                     Container(
-                                                      height: isActive ? 10 : 5,
+                                                      height: 4,
                                                       width: double.infinity,
                                                       decoration: BoxDecoration(
-                                                        color: Colors.white30,
-                                                        borderRadius: BorderRadius.circular(6),
+                                                        color: Colors.white24,
+                                                        borderRadius: BorderRadius.circular(2),
                                                       ),
                                                     ),
                                                     FractionallySizedBox(
                                                       widthFactor: displayPct,
                                                       child: Container(
-                                                        height: isActive ? 10 : 5,
+                                                        height: 4,
                                                         decoration: BoxDecoration(
-                                                          color: AppColors.accent,
-                                                          borderRadius: BorderRadius.circular(6),
-                                                          boxShadow: isActive
-                                                              ? [BoxShadow(
-                                                                  color: AppColors.accent.withValues(alpha: 0.8),
-                                                                  blurRadius: 8, spreadRadius: 2,
-                                                                )]
-                                                              : null,
+                                                          color: isFocused ? AppColors.accent : Colors.white,
+                                                          borderRadius: BorderRadius.circular(2),
                                                         ),
                                                       ),
                                                     ),
-                                                    if (isActive)
-                                                      Positioned(
-                                                        left: (barWidth * displayPct).clamp(0.0, barWidth - 16),
-                                                        child: Container(
-                                                          width: 18, height: 18,
-                                                          decoration: const BoxDecoration(
-                                                            color: Colors.white,
-                                                            shape: BoxShape.circle,
-                                                            boxShadow: [BoxShadow(color: Colors.black54, blurRadius: 6)],
-                                                          ),
+                                                    Positioned(
+                                                      left: (barWidth * displayPct).clamp(0.0, barWidth - 10),
+                                                      child: Container(
+                                                        width: 10, height: 10,
+                                                        decoration: const BoxDecoration(
+                                                          color: Colors.white,
+                                                          shape: BoxShape.circle,
                                                         ),
                                                       ),
+                                                    ),
                                                   ],
                                                 ),
                                               ),
@@ -1395,131 +1627,155 @@ if (isSelect) {
                                           },
                                         ),
                                       ),
-                                      SizedBox(
-                                        width: 52,
-                                        child: Text(
-                                          _duration.inMilliseconds > 0 ? _fmtDur(_duration) : 'LIVE',
-                                          style: TextStyle(
-                                            color: _duration.inMilliseconds > 0 ? Colors.white70 : AppColors.live,
-                                            fontSize: 12,
-                                            fontWeight: _duration.inMilliseconds > 0 ? FontWeight.normal : FontWeight.bold,
-                                          ),
-                                          textAlign: TextAlign.center,
+                                      const SizedBox(width: 8),
+                                      Text(
+                                        _duration.inMilliseconds > 0 ? _fmtDur(_duration) : 'LIVE',
+                                        style: TextStyle(
+                                          color: _duration.inMilliseconds > 0 ? Colors.white70 : AppColors.live,
+                                          fontSize: 12,
+                                          fontWeight: _duration.inMilliseconds > 0 ? FontWeight.normal : FontWeight.bold,
                                         ),
                                       ),
                                     ],
                                   ),
-
-                                  const SizedBox(height: 10),
-
-                                  // ── Suggested channels ─────────────────────
-                                  if (_suggestions.isNotEmpty) ...[
-                                    const Text('Suggested Channels',
-                                        style: TextStyle(color: Colors.white, fontSize: 13,
-                                            fontWeight: FontWeight.bold, fontFamily: 'Inter')),
-                                    const SizedBox(height: 8),
-                                    SizedBox(
-                                      height: 122,
-                                      child: ListView.separated(
-                                        controller: _suggScroll,
-                                        scrollDirection: Axis.horizontal,
-                                        itemCount: _suggestions.length,
-                                        separatorBuilder: (_, __) => const SizedBox(width: 10),
-                                        itemBuilder: (ctx, i) {
-                                          final item = _suggestions[i];
-                                          final focused = _zone == _Zone.suggestions && _suggestionIdx == i;
-                                          return GestureDetector(
-                                            behavior: HitTestBehavior.opaque,
-                                            onTap: () {
-                                              _player?.pause();
-                                              Navigator.pushReplacement(context,
-                                                  MaterialPageRoute(builder: (_) => ChannelPlayerScreen(item: item)));
-                                            },
-                                            child: AnimatedContainer(
-                                              duration: const Duration(milliseconds: 150),
-                                              width: 145,
-                                              decoration: BoxDecoration(
-                                                borderRadius: BorderRadius.circular(10),
-                                                border: Border.all(
-                                                  color: focused ? AppColors.accent : Colors.white12,
-                                                  width: focused ? 2.5 : 1,
-                                                ),
-                                                boxShadow: focused
-                                                    ? [BoxShadow(
-                                                        color: AppColors.accent.withValues(alpha: 0.45),
-                                                        blurRadius: 14, spreadRadius: 1)]
-                                                    : null,
-                                              ),
-                                              child: ClipRRect(
-                                                borderRadius: BorderRadius.circular(9),
-                                                child: _SuggCard(item: item),
-                                              ),
-                                            ),
-                                          );
-                                        },
-                                      ),
+                                  const SizedBox(height: 6),
+                                  // Action Row Below SeekBar
+                                  Center(
+                                    child: Row(
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      children: [
+                                        _bottomActionBtn(
+                                          zone: _Zone.aspectRatio,
+                                          icon: Icons.aspect_ratio,
+                                          label: 'Aspect Ratio',
+                                          onTap: _showAspectMenu,
+                                        ),
+                                        const SizedBox(width: 24),
+                                        _bottomActionBtn(
+                                          zone: _Zone.speed,
+                                          icon: Icons.speed,
+                                          label: 'Speed (${_playbackSpeed}x)',
+                                          onTap: _showSpeedMenu,
+                                        ),
+                                        const SizedBox(width: 24),
+                                        _bottomActionBtn(
+                                          zone: _Zone.subtitles,
+                                          icon: Icons.closed_caption,
+                                          label: 'Subtitles',
+                                          onTap: _showSubtitlesMenu,
+                                        ),
+                                      ],
                                     ),
-                                  ],
+                                  ),
+
                                 ],
                               ),
                             ),
                           ),
-                        ),
+                        ],
                       ],
                     ),
-                  ),
-                ),
-              ),
-
-              // ── VOLUME INDICATOR ──────────────────────────────────────
-              Positioned(
-                right: 32, top: 0, bottom: 0,
-                child: IgnorePointer(
-                  child: AnimatedOpacity(
-                    opacity: _showVolumeBar ? 1.0 : 0.0,
-                    duration: const Duration(milliseconds: 250),
-                    child: Center(
-                      child: Container(
-                        width: 52, height: 200,
-                        decoration: BoxDecoration(
-                          color: Colors.black.withValues(alpha: 0.75),
-                          borderRadius: BorderRadius.circular(26),
-                        ),
-                        padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 10),
-                        child: Column(
-                          mainAxisAlignment: MainAxisAlignment.end,
-                          children: [
-                            Expanded(
-                              child: ClipRRect(
-                                borderRadius: BorderRadius.circular(8),
-                                child: RotatedBox(
-                                  quarterTurns: -1,
-                                  child: LinearProgressIndicator(
-                                    value: (_volume / 100.0).clamp(0.0, 1.0),
-                                    backgroundColor: Colors.white24,
-                                    valueColor: const AlwaysStoppedAnimation<Color>(AppColors.accent),
-                                    minHeight: 10,
-                                  ),
-                                ),
-                              ),
-                            ),
-                            const SizedBox(height: 8),
-                            Icon(
-                              _volume == 0 ? Icons.volume_off : _volume < 40 ? Icons.volume_down : Icons.volume_up,
-                              color: Colors.white, size: 20,
-                            ),
-                            const SizedBox(height: 4),
-                            Text('${_volume.round()}',
-                                style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold)),
-                          ],
-                        ),
-                      ),
-                    ),
+                    ), // FIX #12 TvSafeArea
                   ),
                 ),
               ),
             ],
           ),
+        ),
+      ),
+    ),
+   );
+  }
+
+  Widget _verticalSlider({
+    required IconData icon,
+    required double value, // 0.0 to 1.0
+    required bool focused,
+    required _Zone zone,
+  }) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onVerticalDragUpdate: (details) {
+        final dy = details.primaryDelta ?? 0;
+        final change = -dy / 140.0;
+        if (zone == _Zone.brightness) {
+          setState(() {
+            _brightness = (_brightness + change).clamp(0.1, 1.0);
+          });
+        } else {
+          setState(() {
+            _volume = (_volume + change * 100.0).clamp(0.0, 100.0);
+            _player?.setVolume(_volume);
+          });
+        }
+        _showOverlayFor4s();
+      },
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, color: Colors.white70, size: 20),
+          const SizedBox(height: 8),
+          Container(
+            width: 14,
+            height: 140,
+            decoration: BoxDecoration(
+              color: Colors.white12,
+              borderRadius: BorderRadius.circular(7),
+              border: Border.all(
+                color: focused ? AppColors.accent : Colors.white24,
+                width: focused ? 2.0 : 1.0,
+              ),
+              boxShadow: focused
+                  ? [BoxShadow(color: AppColors.accent.withOpacity(0.4), blurRadius: 10)]
+                  : null,
+            ),
+            child: Stack(
+              alignment: Alignment.bottomCenter,
+              children: [
+                FractionallySizedBox(
+                  heightFactor: value.clamp(0.0, 1.0),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(7),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _bottomActionBtn({
+    required _Zone zone,
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    final focused = _zone == zone;
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 150),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+        decoration: BoxDecoration(
+          color: focused ? Colors.white12 : Colors.transparent,
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: focused ? Colors.white30 : Colors.transparent, width: 1),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, color: Colors.white, size: 18),
+            const SizedBox(width: 6),
+            Text(
+              label,
+              style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
+            ),
+          ],
         ),
       ),
     );

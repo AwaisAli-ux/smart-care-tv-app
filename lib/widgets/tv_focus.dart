@@ -14,31 +14,16 @@
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import '../core/focus/dpad_scroll_helper.dart';
+import '../core/focus/tv_keys.dart';
 import '../theme/app_theme.dart';
 
-// ── Key constants ─────────────────────────────────────────────────────────────
-const _kSelect    = LogicalKeyboardKey.select;
-const _kEnter     = LogicalKeyboardKey.enter;
-const _kSpace     = LogicalKeyboardKey.space;
-
 // ── Helper: scroll focused widget into view ───────────────────────────────────
-void tvEnsureVisible(BuildContext context) {
-  WidgetsBinding.instance.addPostFrameCallback((_) {
-    if (context.mounted) {
-      Scrollable.maybeOf(context)?.position; // touch the scroll position
-      try {
-        Scrollable.ensureVisible(
-          context,
-          alignment: 0.5,
-          duration: const Duration(milliseconds: 280),
-          curve: Curves.easeOut,
-        );
-      } catch (_) {
-        // Not inside a Scrollable — safe to ignore
-      }
-    }
-  });
-}
+// Delegates to DpadScroll so that only one scroll animation is ever in flight.
+// Previously every focus gain started its own 280ms animation; overlapping
+// animations shift hit-test geometry mid-flight and make focus resolution land
+// on the wrong tile (Fix #4, cause 3).
+void tvEnsureVisible(BuildContext context) => DpadScroll.ensureVisible(context);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TvFocusable
@@ -134,8 +119,8 @@ class _TvFocusableState extends State<TvFocusable>
 
   KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
-    final key = event.logicalKey;
-    if (key == _kSelect || key == _kEnter || key == _kSpace) {
+    // FIX #1 — single shared definition, see core/focus/tv_keys.dart.
+    if (isConfirmKey(event.logicalKey)) {
       widget.onActivate?.call();
       return widget.onActivate != null
           ? KeyEventResult.handled
@@ -350,8 +335,10 @@ class _TvListItemState extends State<TvListItem> {
 
   KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
     if (event is! KeyDownEvent) return KeyEventResult.ignored;
-    final key = event.logicalKey;
-    if (key == _kSelect || key == _kEnter || key == _kSpace) {
+    // FIX #1 — was missing the 0x1000.. DPAD_CENTER/ENTER variants that
+    // TvFocusable already accepted, so settings and More rows ignored OK on
+    // some remotes while the tiles above them responded.
+    if (isConfirmKey(event.logicalKey)) {
       widget.onActivate?.call();
       return KeyEventResult.handled;
     }

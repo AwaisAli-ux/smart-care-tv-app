@@ -5,16 +5,33 @@ import 'package:provider/provider.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import '../core/player/player_ui_state.dart';
+import '../core/player/safe_dispose.dart';
+import '../core/widgets/tv_safe_area.dart';
 import '../models/content_model.dart';
 import '../theme/app_theme.dart';
+import '../widgets/speed_picker.dart';
 import '../services/app_state.dart';
 import '../services/iptv_service.dart';
 import '../services/device_profile_service.dart';
+import '../services/player_factory.dart';
 
-const _movieAudioCh = MethodChannel('com.example.mbapp/audio');
+const _movieAudioCh = MethodChannel('com.smartcaretv.app/audio');
 
-/// TV navigation zones in the movie overlay
-enum _MZone { back, fav, replay, play, forward, progress, suggestions }
+enum _MZone {
+  back,
+  lock,
+  fav,
+  settings,
+  replay,
+  play,
+  forward,
+  progress,
+  aspectRatio,
+  speed,
+  subtitles,
+  suggestions
+}
 
 /// Full-screen movie/VOD player with 100% reliable TV D-pad navigation.
 /// A single root FocusNode handles ALL remote key events using a _MZone state variable.
@@ -29,7 +46,11 @@ class MoviePlayerScreen extends StatefulWidget {
 class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
   Player? _player;
   VideoController? _videoCtrl;
-  final BoxFit _videoFit = BoxFit.contain;
+  BoxFit _videoFit = BoxFit.contain;
+  double _playbackSpeed = 1.0;
+  bool _controlsLocked = false;
+  bool _disposed = false;
+  bool _exiting = false;
 
   bool _loading = true;
   bool _autoRetrying = false;
@@ -45,7 +66,7 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
   Duration _duration = Duration.zero;
   bool _playing = false;
 
-  double _volume = 80.0;
+  double _volume = 100.0;
   bool _showVolumeBar = false;
   Timer? _hideVolumeTimer;
 
@@ -55,6 +76,7 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
   // ── Phone touch seek state ───────────────────────────────────────────────────
   bool     _draggingProgress = false;
   Duration _dragPosition     = Duration.zero;
+  DateTime? _lastSeekTime;
 
   // ── TV navigation state ──────────────────────────────────────────────────────
   _MZone _zone = _MZone.play;
@@ -66,6 +88,41 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
   StreamSubscription? _positionSub;
   StreamSubscription? _durationSub;
   StreamSubscription? _playingSub;
+  StreamSubscription? _bufferingSub; // FIX #6
+  StreamSubscription? _widthSub;     // FIX #6
+
+  // ── FIX #6: play/pause button doubles as the loader ──────────────────────
+  bool _buffering = false;
+  bool _firstFrame = false;
+  PlayerUiState _uiState = PlayerUiState.loading;
+
+  /// Recomputes the button state and rebuilds only when it actually changed —
+  /// this must never add a rebuild to the position tick.
+  void _syncUiState() {
+    if (!mounted) return;
+    final next = resolvePlayerUiState(
+      hasError: _streamDead,
+      isLoading: _loading || _autoRetrying,
+      // Any sign of life counts, not just a decoded-frame report: some
+      // sources never emit stream.width, and gating on it alone left the
+      // spinner up forever.
+      hasFirstFrame: _firstFrame ||
+          _playing ||
+          _duration.inMilliseconds > 0 ||
+          _position.inMilliseconds > 0,
+      isBuffering: _buffering,
+      isPlaying: _playing,
+    );
+    if (next == _uiState) return;
+    setState(() => _uiState = next);
+  }
+
+  // ── ANR watchdog — cancelled as soon as playback starts ──────────────────
+  Timer? _watchdogTimer;
+
+  // Prevents the watchdog/retry timers from firing a second, overlapping
+  // _startPlay() while a previous probe is still in flight.
+  bool _startingPlay = false;
 
   /// Single root focus node — handles ALL remote key events
   final FocusNode _focus = FocusNode(debugLabel: 'MoviePlayer');
@@ -86,11 +143,15 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
     super.initState();
     _currentItem = widget.item;
     _focus.addListener(_onFocusChange);
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    // Fire-and-forget — see channel_player_screen.dart's initState() for why:
+    // awaiting the orientation+immersive-mode transition before playback
+    // doesn't avoid the ANR (confirmed the transition itself can take 5+
+    // seconds on the Android side regardless), it just delays screen entry.
     SystemChrome.setPreferredOrientations([
       DeviceOrientation.landscapeLeft,
       DeviceOrientation.landscapeRight,
     ]);
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         // Cache device profile once so we don't read context inside async gaps
@@ -103,17 +164,27 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
 
   @override
   void dispose() {
+    _disposed = true;
     _focus.removeListener(_onFocusChange);
     _hideTimer?.cancel();
     _retryTimer?.cancel();
     _hideVolumeTimer?.cancel();
+    _watchdogTimer?.cancel();
     _suggScroll.dispose();
     _focus.dispose();
     _completedSub?.cancel();
     _positionSub?.cancel();
     _durationSub?.cancel();
     _playingSub?.cancel();
-    _player?.dispose();
+    _bufferingSub?.cancel(); // FIX #6
+    _widthSub?.cancel();     // FIX #6
+    final p = _player;
+    _player = null;
+    if (p != null) {
+      // Ordered teardown — see core/player/safe_dispose.dart. Disposing while
+      // stop() is still running natively aborts the whole process.
+      Future.microtask(() => safeDisposePlayer(p));
+    }
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
         overlays: SystemUiOverlay.values);
     SystemChrome.setPreferredOrientations([
@@ -122,6 +193,32 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
       DeviceOrientation.landscapeRight,
     ]);
     super.dispose();
+  }
+
+  /// Safely stop player and exit screen — prevents crash from race conditions
+  Future<void> _safeExit() async {
+    if (_exiting) return;
+    _exiting = true;
+    if (mounted) {
+      setState(() {
+        _videoCtrl = null;
+      });
+    }
+    await Future.delayed(const Duration(milliseconds: 100));
+    try {
+      _hideTimer?.cancel();
+      _retryTimer?.cancel();
+      _completedSub?.cancel();
+      _positionSub?.cancel();
+      _durationSub?.cancel();
+      _playingSub?.cancel();
+      _bufferingSub?.cancel(); // FIX #6
+      _widthSub?.cancel();     // FIX #6
+      final p = _player;
+      _player = null;
+      await safeDisposePlayer(p);
+    } catch (_) {}
+    if (mounted) Navigator.of(context).pop();
   }
 
   void _onFocusChange() {
@@ -171,7 +268,10 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
     });
     if (_player != null) {
       setState(() {
-        _position = _player!.state.position;
+        final now = DateTime.now();
+        if (_lastSeekTime == null || now.difference(_lastSeekTime!) > const Duration(milliseconds: 800)) {
+          _position = _player!.state.position;
+        }
         _duration = _player!.state.duration;
         _playing  = _player!.state.playing;
       });
@@ -254,16 +354,15 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
   }
 
   Future<void> _startPlay() async {
-    if (!mounted) return;
+    if (!mounted || _startingPlay) return;
+    _startingPlay = true;
 
-    // Read player settings BEFORE any await — safe synchronous context access.
-    final appState   = context.read<AppState>();
-    final hwAccel    = appState.hardwareAccelEnabled;
-    final bufBytes   = appState.bufferBytes;   // RAM-aware
-    final profile    = _profile;
+    final appState = context.read<AppState>();
+    final hwAccel  = appState.hardwareAccelEnabled;
+    final bufBytes = appState.bufferBytes;
+    final profile  = _profile;
 
     debugPrint('[Movie] ▶ ${_currentItem.title} | device=${profile.deviceClass} '
-        'hevc=${profile.supportsHevc} hdr=${profile.supportsHdr} '
         'buf=${bufBytes ~/ (1024 * 1024)}MB failoverLevel=$_failoverLevel');
 
     setState(() {
@@ -273,229 +372,82 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
       _position     = Duration.zero;
       _duration     = Duration.zero;
       _playing      = false;
+      _buffering    = false; // FIX #6
+      _firstFrame   = false; // FIX #6 — a restart has no frame yet
     });
+    _syncUiState(); // FIX #6
 
     _completedSub?.cancel();
     _positionSub?.cancel();
     _durationSub?.cancel();
     _playingSub?.cancel();
-    _player?.dispose();
+    _bufferingSub?.cancel(); // FIX #6
+    _widthSub?.cancel();     // FIX #6
+
+    final playerToDispose = _player;
+    if (playerToDispose != null) {
+      Future.microtask(() async {
+        try {
+          await playerToDispose.pause().timeout(const Duration(seconds: 3));
+          await playerToDispose.stop().timeout(const Duration(seconds: 3));
+          await playerToDispose.dispose().timeout(const Duration(seconds: 3));
+        } catch (_) {}
+      });
+    }
+    
     _videoCtrl = null;
     _player    = null;
 
+    // 30-second overall watchdog
+    _watchdogTimer?.cancel();
+    _watchdogTimer = Timer(const Duration(seconds: 30), () {
+      if (!mounted) return;
+      debugPrint('⏱ [Movie] 30s watchdog fired');
+      _scheduleRetry();
+    });
+
     try {
-      await _requestAudio();
+      // Audio focus is best-effort and takes up to 2 s on some boxes; awaiting
+      // it here just delayed the first frame by that much. Fire and forget.
+      unawaited(_requestAudio());
       final urls = _movieUrls();
 
-      final player = Player(
-        configuration: PlayerConfiguration(
-          bufferSize: bufBytes,
-          logLevel: MPVLogLevel.warn,
-        ),
+      // PlayerFactory fires all mpv properties concurrently (Future.wait)
+      // instead of 20+ sequential awaits — eliminates the ANR on Android.
+      // lastFailureWasPermanent is reset inside probe() on every call.
+      final result = await PlayerFactory.probe(
+        urls: urls,
+        bufBytes: bufBytes,
+        hwAccel: hwAccel,
+        profile: profile,
+        streamHeaders: _streamHeaders,
+        isLive: false,
+        probeTimeout: const Duration(seconds: 15),
       );
 
-      // Universal mpv configuration — same brand coverage as channel player.
-      final platform = player.platform;
-      if (platform is NativePlayer) {
-        // ── Caching & buffering ──
-        await platform.setProperty('cache', 'yes');
-        await platform.setProperty('cache-secs', '60');             // 60s for VOD
-        await platform.setProperty('demuxer-readahead-secs', '30');
-        await platform.setProperty('demuxer-max-bytes', '$bufBytes');
-        await platform.setProperty('demuxer-max-back-bytes', '${bufBytes ~/ 4}');
-        await platform.setProperty('demuxer-thread', 'yes');
+      if (result == null) throw Exception('All movie URLs failed');
+      if (!mounted) { result.player.dispose(); return; }
 
-        // ── Network & reconnect ──
-        await platform.setProperty('network-timeout', '15');
-        await platform.setProperty('reconnect-streamed', 'yes');
-        await platform.setProperty('reconnect-max-retries', '5');
-        await platform.setProperty('reconnect-delay-max', '4');
-        await platform.setProperty('stream-lavf-o',
-            'reconnect=1,reconnect_streamed=1,reconnect_delay_max=4');
+      _player    = result.player;
+      _videoCtrl = result.controller;
+      await result.player.setVolume(_volume);
 
-        // ── AES-128 HLS & encrypted stream support ──
-        await platform.setProperty('demuxer-lavf-o',
-            'allowed_extensions=ALL,'
-            'protocol_whitelist=file,http,https,tcp,tls,crypto,data,ftp');
-        await platform.setProperty('tls-verify', 'no');
-        await platform.setProperty('tls-min-version', '1.0');
-
-        // ── Seeking (VOD) ──
-        await platform.setProperty('force-seekable', 'yes');
-        await platform.setProperty('hr-seek', 'yes');
-
-        // ── Device-specific HTTP headers ──
-        final ua      = profile.userAgent;
-        const referer = '${IptvService.baseUrl}/';
-        const origin  = IptvService.baseUrl;
-        await platform.setProperty('http-header-fields',
-            'User-Agent: $ua\nReferer: $referer\nOrigin: $origin\nAccept: */*\nConnection: keep-alive');
-
-        // ── Codec / decoding ──
-        await platform.setProperty('hwdec', hwAccel ? 'auto-safe' : 'no');
-        await platform.setProperty('vd-lavc-threads', '0');
-        await platform.setProperty('vd-lavc-skiploopfilter', 'nonref');
-        await platform.setProperty('vd-lavc-software-fallback', 'yes');
-        await platform.setProperty('framedrop', 'decoder+vo');
-
-        // ── H.264 force for HEVC-unsupported devices ──
-        if (profile.forceH264) {
-          await platform.setProperty('vd-lavc-vcodec', 'h264');
-          debugPrint('[Movie] H.264 forced (no HEVC decoder)');
-        }
-
-        // ── HDR disable on SDR-only displays ──
-        if (profile.disableHdr) {
-          await platform.setProperty('tone-mapping', 'clip');
-          await platform.setProperty('hdr-compute-peak', 'no');
-          debugPrint('[Movie] HDR tone-mapping disabled (SDR display)');
-        }
-
-        // ── Video output & sync ──
-        await platform.setProperty('gpu-api', 'opengl');
-        await platform.setProperty('opengl-es', '2');
-        await platform.setProperty('opengl-glfinish', 'yes');
-        await platform.setProperty('video-sync', 'audio');
-        await platform.setProperty('video-latency-hacks',
-            profile.enableLatencyHacks ? 'yes' : 'no');
-
-        // ── Audio ──
-        await platform.setProperty('audio-stream-silence', 'yes');
-        await platform.setProperty('audio-spdif', '');
-
-        // ── Misc ──
-        await platform.setProperty('ytdl', 'no');
-        await platform.setProperty('demuxer-lavf-analyzeduration', '2');
-        await platform.setProperty('demuxer-lavf-probesize', '1048576');
-      }
-
-      final ctrl = VideoController(
-        player,
-        configuration: VideoControllerConfiguration(enableHardwareAcceleration: hwAccel),
-      );
-
-      bool ok = false;
-      String? lastError;
-
-      // 12s per-URL probe timeout — fast enough to try all candidates in <60s
-      const probeTimeout = Duration(seconds: 12);
-
-      for (final url in urls) {
-        try {
-          debugPrint('▶ [Movie] Trying: $url');
-
-          // ── Fast health-check: skip obviously dead URLs immediately ──────
-          // HEAD request takes <1s and avoids wasting 12s on 403/404 endpoints.
-          final alive = await IptvService.streamHealthCheck(url)
-              .timeout(const Duration(seconds: 4), onTimeout: () => true);
-          if (!alive) {
-            debugPrint('✗ [Movie] Health-check failed — skipping $url');
-            lastError = 'server returned error status';
-            continue;
+      _completedSub = result.player.stream.completed.listen((done) {
+        if (done && mounted) setState(() { _position = _duration; });
+      });
+      _positionSub = result.player.stream.position.listen((p) {
+        if (mounted && _showOverlay) {
+          final now = DateTime.now();
+          if (_lastSeekTime == null || now.difference(_lastSeekTime!) > const Duration(milliseconds: 800)) {
+            setState(() => _position = p);
           }
-
-          // Collect the FIRST fatal error (ignore non-fatal warnings)
-          String? fatalError;
-          final errSub = player.stream.error.listen((err) {
-            if (fatalError == null && !_isNonFatalError(err)) {
-              fatalError = err;
-            }
-            debugPrint('⚠ [Movie] Stream error for $url: $err');
-          });
-
-          await player.open(Media(url, httpHeaders: _streamHeaders));
-
-          // ── Relaxed success gate ──────────────────────────────────────────
-          // Accept ANY of the following as proof the stream is alive:
-          //   (a) playing=true           — audio/video decoder started
-          //   (b) width > 0              — video frame decoded
-          //   (c) duration > 0 + buffering→false — metadata + data arrived
-          // This fixes streams that start playing before sending a duration,
-          // and streams that send duration before the first video frame.
-          final successCompleter = Completer<void>();
-          bool gotDuration = false;
-          bool gotWidth    = false;
-          bool gotPlaying  = false;
-          bool hasBuffered = false;
-
-          void checkSuccess() {
-            if (successCompleter.isCompleted) return;
-            // Gate 1: playing alone is enough — decoder confirmed active
-            if (gotPlaying) { successCompleter.complete(); return; }
-            // Gate 2: video frame seen
-            if (gotWidth)   { successCompleter.complete(); return; }
-            // Gate 3: metadata + buffer cycle completed
-            if (gotDuration && hasBuffered) { successCompleter.complete(); return; }
-          }
-
-          final widthSub = player.stream.width.listen((w) {
-            if (w != null && w > 0) { gotWidth = true; checkSuccess(); }
-          });
-          final durSub = player.stream.duration.listen((d) {
-            if (d.inMilliseconds > 0) { gotDuration = true; checkSuccess(); }
-          });
-          final playingSub = player.stream.playing.listen((playing) {
-            if (playing) { gotPlaying = true; checkSuccess(); }
-          });
-          final bufferingSub = player.stream.buffering.listen((buffering) {
-            if (buffering) {
-              hasBuffered = true;
-            } else if (hasBuffered) {
-              // Buffering completed → data arrived
-              checkSuccess();
-            }
-          });
-
-          final result = await Future.any([
-            successCompleter.future.then((_) => 'ok'),
-            Future.delayed(probeTimeout).then((_) => 'timeout'),
-          ]);
-
-          await widthSub.cancel();
-          await durSub.cancel();
-          await bufferingSub.cancel();
-          await playingSub.cancel();
-          await errSub.cancel();
-
-          if (result == 'timeout' || fatalError != null) {
-            final reason = fatalError ?? 'timeout after ${probeTimeout.inSeconds}s';
-            debugPrint('✗ [Movie] Failed $url: $reason');
-            lastError = reason;
-            continue;
-          }
-
-          debugPrint('✅ [Movie] Playing: $url');
-          ok = true;
-          break;
-        } catch (e) {
-          lastError = e.toString();
-          debugPrint('✗ [Movie] Exception $url: $e');
-        }
-      }
-
-      if (!ok) {
-        player.dispose();
-        throw Exception('All URLs failed. Last error: $lastError');
-      }
-
-      if (!mounted) { player.dispose(); return; }
-
-      _player    = player;
-      _videoCtrl = ctrl;
-      await player.setVolume(_volume);
-
-      _completedSub = player.stream.completed.listen((done) {
-        if (done && mounted) {
-          setState(() { _position = _duration; });
         }
       });
-      _positionSub = player.stream.position.listen((p) {
-        if (mounted && _showOverlay) setState(() => _position = p);
-      });
-      _durationSub = player.stream.duration.listen((d) {
+      _durationSub = result.player.stream.duration.listen((d) {
         if (mounted) setState(() => _duration = d);
+          _syncUiState(); // duration is a sign of life too
       });
-      _playingSub = player.stream.playing.listen((p) {
+      _playingSub = result.player.stream.playing.listen((p) {
         if (mounted) {
           setState(() {
             _playing = p;
@@ -506,15 +458,39 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
               _showOverlay = true;
             }
           });
+          _syncUiState(); // FIX #6
         }
       });
 
+      // FIX #6 — nothing subscribed to buffering before, so a mid-playback
+      // stall left a stale play/pause icon on screen.
+      _bufferingSub = result.player.stream.buffering.listen((b) {
+        if (!mounted) return;
+        _buffering = b;
+        _syncUiState();
+      });
+
+      // FIX #6 — first decoded frame: until this arrives there is nothing to
+      // pause, so the button must stay a spinner.
+      _widthSub = result.player.stream.width.listen((w) {
+        if (!mounted) return;
+        if (w != null && w > 0 && !_firstFrame) {
+          _firstFrame = true;
+          _syncUiState();
+        }
+      });
+
+      _watchdogTimer?.cancel();
+      _watchdogTimer = null;
+      _startingPlay = false;
       if (!mounted) return;
       setState(() => _loading = false);
+      _syncUiState(); // FIX #6
       _showOverlayFor4s();
       await _requestAudio();
     } catch (e) {
       debugPrint('❌ [Movie] $e');
+      _startingPlay = false;
       if (!mounted) return;
       _scheduleRetry();
     }
@@ -522,6 +498,22 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
 
   void _scheduleRetry() {
     _retryTimer?.cancel();
+
+    // The provider answered "not there" on every candidate URL. That is
+    // permanent, so skip the whole retry/failover cycle and tell the user
+    // straight away instead of spinning for two minutes.
+    if (PlayerFactory.lastFailureWasPermanent) {
+      if (mounted) {
+        setState(() {
+          _autoRetrying = false;
+          _loading      = false;
+          _streamDead   = true;
+        });
+        _syncUiState();
+      }
+      return;
+    }
+
     _attemptNumber++;
 
     if (_attemptNumber > _maxAttempts) {
@@ -540,6 +532,7 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
           _loading      = false;
           _streamDead   = true;
         });
+        _syncUiState(); // FIX #6 — button becomes a retry icon
       }
       debugPrint('❌ [Movie] Stream marked dead after all failover levels exhausted');
       return;
@@ -550,6 +543,7 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
       _loading         = false;
       _retryCountdown  = 5;
     });
+    _syncUiState(); // FIX #6
     _retryTimer = Timer.periodic(const Duration(seconds: 1), (t) {
       if (!mounted) { t.cancel(); return; }
       setState(() => _retryCountdown--);
@@ -582,6 +576,10 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
     final clamped = target < Duration.zero
         ? Duration.zero
         : (target > _duration ? _duration : target);
+    setState(() {
+      _position = clamped;
+      _lastSeekTime = DateTime.now();
+    });
     _player!.seek(clamped);
   }
 
@@ -589,6 +587,7 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
     if (_player == null) return;
     _player!.playOrPause();
     setState(() => _playing = _player!.state.playing);
+    _syncUiState(); // FIX #6
     _resetHideTimer();
   }
 
@@ -597,8 +596,14 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
     final appState = context.read<AppState>();
     switch (_zone) {
       case _MZone.back:
-        _player?.pause();
-        Navigator.of(context).pop();
+        _safeExit();
+        break;
+
+      case _MZone.lock:
+        setState(() {
+          _controlsLocked = !_controlsLocked;
+        });
+        _showOverlayFor4s();
         break;
       case _MZone.fav:
         appState.toggleFavorite(_currentItem);
@@ -612,6 +617,9 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
         ));
         _resetHideTimer();
         setState(() {});
+        break;
+      case _MZone.settings:
+        _showSettingsMenu();
         break;
       case _MZone.replay:
         if (_player != null) {
@@ -631,12 +639,30 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
       case _MZone.progress:
         _togglePlay();
         break;
+      case _MZone.aspectRatio:
+        _showAspectMenu();
+        break;
+      case _MZone.speed:
+        _showSpeedMenu();
+        break;
+      case _MZone.subtitles:
+        _showSubtitlesMenu();
+        break;
       case _MZone.suggestions:
         if (_suggestionIdx < _suggestions.length) {
           final item = _suggestions[_suggestionIdx];
-          _player?.pause();
-          Navigator.pushReplacement(context,
-              MaterialPageRoute(builder: (_) => MoviePlayerScreen(item: item)));
+          final p = _player;
+          if (p != null) {
+            p.stop().catchError((_) => null).then((_) {
+              if (mounted) {
+                Navigator.pushReplacement(context,
+                    MaterialPageRoute(builder: (_) => MoviePlayerScreen(item: item)));
+              }
+            });
+          } else {
+            Navigator.pushReplacement(context,
+                MaterialPageRoute(builder: (_) => MoviePlayerScreen(item: item)));
+          }
         }
         break;
     }
@@ -671,16 +697,34 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
 
     if (_showOverlay) _resetHideTimer();
 
+    // Dedicated media seek keys — jump 1 min (60 seconds)
+    final isMediaLeft = k == LogicalKeyboardKey.mediaRewind ||
+        k == LogicalKeyboardKey.mediaTrackPrevious;
+    final isMediaRight = k == LogicalKeyboardKey.mediaFastForward ||
+        k == LogicalKeyboardKey.mediaTrackNext;
+    if (isMediaLeft || isMediaRight) {
+      if (!_controlsLocked && _player != null) {
+        final step = const Duration(seconds: 60);
+        final target = isMediaLeft
+            ? _player!.state.position - step
+            : _player!.state.position + step;
+        _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
+        _showOverlayFor4s();
+      }
+      return KeyEventResult.handled;
+    }
+
     // Back / Escape
     final isBack = k == LogicalKeyboardKey.goBack ||
         k == LogicalKeyboardKey.escape ||
         k.keyId == 0x1000000a6 || k.keyId == 166 || k.keyId == 8;
     if (isBack) {
       if (_showOverlay) {
-        setState(() => _showOverlay = false);
+        if (!_controlsLocked) {
+          setState(() => _showOverlay = false);
+        }
       } else {
-        _player?.pause();
-        Navigator.of(context).pop();
+        _safeExit();
       }
       return KeyEventResult.handled;
     }
@@ -689,7 +733,9 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
     if (k == LogicalKeyboardKey.mediaPlayPause ||
         k == LogicalKeyboardKey.mediaPlay ||
         k == LogicalKeyboardKey.mediaPause) {
-      _togglePlay();
+      if (!_controlsLocked) {
+        _togglePlay();
+      }
       return KeyEventResult.handled;
     }
 
@@ -699,35 +745,59 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
       final isSeekRight = k == LogicalKeyboardKey.arrowRight;
       setState(() {
         _showOverlay = true;
-        if (isSeekLeft) {
-          _zone = _MZone.replay;
-        } else if (isSeekRight) {
-          _zone = _MZone.forward;
+        if (_controlsLocked) {
+          _zone = _MZone.lock;
         } else {
-          _zone = _MZone.play;
+          if (isSeekLeft) {
+            _zone = _MZone.replay;
+          } else if (isSeekRight) {
+            _zone = _MZone.forward;
+          } else {
+            _zone = _MZone.play;
+          }
         }
       });
       _resetHideTimer();
-      if (isSeekLeft && _player != null) {
-        final target = _player!.state.position - const Duration(seconds: 10);
-        _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
-      } else if (isSeekRight && _player != null) {
-        final target = _player!.state.position + const Duration(seconds: 10);
-        _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
+      if (!_controlsLocked) {
+        if (isSeekLeft && _player != null) {
+          final target = _player!.state.position - const Duration(seconds: 10);
+          _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
+        } else if (isSeekRight && _player != null) {
+          final target = _player!.state.position + const Duration(seconds: 10);
+          _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
+        }
       }
       return KeyEventResult.handled;
     }
 
+    // Controls Locked Guard: restrict navigation when locked
+    if (_controlsLocked) {
+      final isSelect = k == LogicalKeyboardKey.select ||
+          k == LogicalKeyboardKey.enter ||
+          k == LogicalKeyboardKey.gameButtonA ||
+          k.keyId == 13 ||
+          k.keyId == 23 ||
+          k.keyId == 96 ||
+          k.keyId == 160;
+      if (isSelect) {
+        if (_zone == _MZone.lock) {
+          _activateZone();
+        }
+        return KeyEventResult.handled;
+      }
+      setState(() => _zone = _MZone.lock);
+      return KeyEventResult.handled;
+    }
+
     // Select / Enter → activate current zone
-    // Extended select: covers all TV remote OK/Enter variants
-    // 13=Enter, 23=DPAD_CENTER (Amlogic/Rockchip), 96=BUTTON_A, 160=NUMPAD_ENTER
     final isSelect = k == LogicalKeyboardKey.select ||
         k == LogicalKeyboardKey.enter ||
         k == LogicalKeyboardKey.gameButtonA ||
         k.keyId == 13 ||
         k.keyId == 23 ||
         k.keyId == 96 ||
-        k.keyId == 160;    if (isSelect) {
+        k.keyId == 160;
+    if (isSelect) {
       _activateZone();
       return KeyEventResult.handled;
     }
@@ -736,18 +806,20 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
     if (k == LogicalKeyboardKey.arrowLeft) {
       setState(() {
         switch (_zone) {
-          case _MZone.fav:     _zone = _MZone.back; break;
-          case _MZone.play:    _zone = _MZone.replay; break;
-          case _MZone.forward: _zone = _MZone.play; break;
+          case _MZone.lock:     _zone = _MZone.back; break;
+          case _MZone.fav:      _zone = _MZone.lock; break;
+          case _MZone.settings: _zone = _MZone.fav; break;
+          case _MZone.replay:   break;
+          case _MZone.play:     _zone = _MZone.replay; break;
+          case _MZone.forward:  _zone = _MZone.play; break;
           case _MZone.progress:
             if (_player != null) {
-              final target = _player!.state.position - const Duration(minutes: 1);
+              final target = _player!.state.position - const Duration(seconds: 60);
               _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
             }
             break;
-          case _MZone.suggestions:
-            if (_suggestionIdx > 0) { _suggestionIdx--; _scrollSuggestions(); }
-            break;
+          case _MZone.speed:       _zone = _MZone.aspectRatio; break;
+          case _MZone.subtitles:   _zone = _MZone.speed; break;
           default: break;
         }
       });
@@ -757,18 +829,20 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
     if (k == LogicalKeyboardKey.arrowRight) {
       setState(() {
         switch (_zone) {
-          case _MZone.back:    _zone = _MZone.fav; break;
-          case _MZone.replay:  _zone = _MZone.play; break;
-          case _MZone.play:    _zone = _MZone.forward; break;
+          case _MZone.back:       _zone = _MZone.lock; break;
+          case _MZone.lock:       _zone = _MZone.fav; break;
+          case _MZone.fav:        _zone = _MZone.settings; break;
+          case _MZone.replay:     _zone = _MZone.play; break;
+          case _MZone.play:       _zone = _MZone.forward; break;
+          case _MZone.forward:    break;
           case _MZone.progress:
             if (_player != null) {
-              final target = _player!.state.position + const Duration(minutes: 1);
+              final target = _player!.state.position + const Duration(seconds: 60);
               _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
             }
             break;
-          case _MZone.suggestions:
-            if (_suggestionIdx < _suggestions.length - 1) { _suggestionIdx++; _scrollSuggestions(); }
-            break;
+          case _MZone.aspectRatio: _zone = _MZone.speed; break;
+          case _MZone.speed:       _zone = _MZone.subtitles; break;
           default: break;
         }
       });
@@ -779,15 +853,13 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
       setState(() {
         switch (_zone) {
           case _MZone.replay:      _zone = _MZone.back; break;
-          case _MZone.play:        _zone = _MZone.back; break;
+          case _MZone.play:        _zone = _MZone.lock; break;
           case _MZone.forward:     _zone = _MZone.fav; break;
           case _MZone.progress:    _zone = _MZone.play; break;
-          case _MZone.suggestions:
-            if (_duration.inMilliseconds > 0) {
-              _zone = _MZone.progress;
-            } else {
-              _zone = _MZone.play;
-            }
+          case _MZone.aspectRatio:
+          case _MZone.speed:
+          case _MZone.subtitles:
+            _zone = _MZone.progress;
             break;
           default: break;
         }
@@ -798,23 +870,21 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
     if (k == LogicalKeyboardKey.arrowDown) {
       setState(() {
         switch (_zone) {
-          case _MZone.back:
-          case _MZone.fav:    _zone = _MZone.play; break;
+          case _MZone.back:        _zone = _MZone.replay; break;
+          case _MZone.lock:
+            _zone = _MZone.play;
+            break;
+          case _MZone.fav:
+          case _MZone.settings:
+            _zone = _MZone.forward;
+            break;
           case _MZone.replay:
           case _MZone.play:
           case _MZone.forward:
-            if (_duration.inMilliseconds > 0) {
-              _zone = _MZone.progress;
-            } else if (_suggestions.isNotEmpty) {
-              _zone = _MZone.suggestions;
-              _scrollSuggestions();
-            }
+            _zone = _MZone.progress;
             break;
           case _MZone.progress:
-            if (_suggestions.isNotEmpty) {
-              _zone = _MZone.suggestions;
-              _scrollSuggestions();
-            }
+            _zone = _MZone.speed;
             break;
           default: break;
         }
@@ -825,11 +895,255 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
     return KeyEventResult.ignored;
   }
 
+  void _showSettingsMenu() {
+    _hideTimer?.cancel();
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.black.withOpacity(0.95),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (context) {
+        return Container(
+          padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Stream Details', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 16),
+              _settingsRow('Resolution', _player?.state.width != null && _player!.state.width! > 0 ? '${_player!.state.width}x${_player!.state.height}' : 'Auto/Detecting'),
+              _settingsRow('Device Profile', '${_profile.brand} ${_profile.model} (${_profile.deviceId})'),
+              _settingsRow('Failover quality tier', _failoverLevel == 0 ? 'Original' : _failoverLevel == 1 ? 'Medium Fallback' : 'Lowest Fallback'),
+              _settingsRow('Audio Focus State', 'Acquired'),
+              const SizedBox(height: 16),
+            ],
+          ),
+        );
+      },
+    ).then((_) => _resetHideTimer());
+  }
+
+  Widget _settingsRow(String label, String val) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8.0),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: const TextStyle(color: Colors.white70, fontSize: 14)),
+          Text(val, style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold)),
+        ],
+      ),
+    );
+  }
+
+  void _showAspectMenu() {
+    _hideTimer?.cancel();
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.black.withOpacity(0.95),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (context) {
+        return Container(
+          padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('Aspect Ratio', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 12),
+              ListTile(
+                focusColor: Colors.white24,
+                title: const Text('Fit (Original)', style: TextStyle(color: Colors.white)),
+                leading: Icon(Icons.fit_screen, color: _videoFit == BoxFit.contain ? AppColors.accent : Colors.white70),
+                onTap: () {
+                  setState(() => _videoFit = BoxFit.contain);
+                  Navigator.pop(context);
+                  _showOverlayFor4s();
+                },
+              ),
+              ListTile(
+                focusColor: Colors.white24,
+                title: const Text('Stretch (16:9)', style: TextStyle(color: Colors.white)),
+                leading: Icon(Icons.open_in_full, color: _videoFit == BoxFit.fill ? AppColors.accent : Colors.white70),
+                onTap: () {
+                  setState(() => _videoFit = BoxFit.fill);
+                  Navigator.pop(context);
+                  _showOverlayFor4s();
+                },
+              ),
+              ListTile(
+                focusColor: Colors.white24,
+                title: const Text('Zoom (Crop)', style: TextStyle(color: Colors.white)),
+                leading: Icon(Icons.fullscreen, color: _videoFit == BoxFit.cover ? AppColors.accent : Colors.white70),
+                onTap: () {
+                  setState(() => _videoFit = BoxFit.cover);
+                  Navigator.pop(context);
+                  _showOverlayFor4s();
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    ).then((_) => _resetHideTimer());
+  }
+
+  // FIX #10 — was a showModalBottomSheet of plain ListTiles: nothing in it was
+  // focusable and it stole focus from the player's key handler, so a TV remote
+  // could not operate it at all. Now uses the shared D-pad speed picker.
+  Future<void> _showSpeedMenu() async {
+    _hideTimer?.cancel();
+    final picked = await showSpeedPicker(context, current: _playbackSpeed);
+    if (!mounted) {
+      return;
+    }
+    // null = backed out; leave the speed untouched.
+    if (picked != null && picked != _playbackSpeed) {
+      setState(() => _playbackSpeed = picked);
+      await _player?.setRate(picked);
+      if (mounted) _showSpeedToast(picked); // FIX #10 (item 4)
+    }
+    _resetHideTimer();
+  }
+
+  /// Brief confirmation overlay so the user knows the change landed.
+  void _showSpeedToast(double speed) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Speed ${speed}x'),
+        duration: const Duration(milliseconds: 1200),
+        backgroundColor: Colors.black87,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  void _showSubtitlesMenu() {
+    _hideTimer?.cancel();
+    final tracks = _player?.state.tracks.subtitle ?? [];
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.black.withOpacity(0.95),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (context) {
+        return Container(
+          padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('Subtitles', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 12),
+              if (tracks.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 24),
+                  child: Text('No subtitle tracks available', style: TextStyle(color: Colors.white70)),
+                )
+              else
+                Expanded(
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: tracks.length,
+                    itemBuilder: (context, idx) {
+                      final track = tracks[idx];
+                      final isSelected = _player?.state.track.subtitle == track;
+                      return ListTile(
+                        title: Text(track.title ?? track.language ?? 'Track $idx', style: const TextStyle(color: Colors.white)),
+                        leading: Icon(Icons.subtitles, color: isSelected ? AppColors.accent : Colors.white70),
+                        onTap: () {
+                          _player?.setSubtitleTrack(track);
+                          Navigator.pop(context);
+                          _showOverlayFor4s();
+                        },
+                      );
+                    },
+                  ),
+                ),
+            ],
+          ),
+        );
+      },
+    ).then((_) => _resetHideTimer());
+  }
+
+  void _showCastModal() {
+    _hideTimer?.cancel();
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: AppColors.bg3,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Row(
+          children: [
+            Icon(Icons.cast, color: Colors.white),
+            SizedBox(width: 12),
+            Text('Chromecast', style: TextStyle(color: Colors.white)),
+          ],
+        ),
+        content: const Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Searching for compatible screens on your network...', style: TextStyle(color: Colors.white70)),
+            SizedBox(height: 16),
+            Center(
+              child: SizedBox(
+                width: 24, height: 24,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2,
+                  valueColor: AlwaysStoppedAnimation<Color>(AppColors.accent),
+                ),
+              ),
+            ),
+            SizedBox(height: 16),
+            Text('Note: Make sure your TV or streaming device is on the same Wi-Fi network.', style: TextStyle(color: Colors.white38, fontSize: 11)),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel', style: TextStyle(color: AppColors.accent)),
+          ),
+        ],
+      ),
+    ).then((_) => _resetHideTimer());
+  }
+
+  Widget _bottomActionBtn({
+    required _MZone zone,
+    required IconData icon,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    final focused = _zone == zone;
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 150),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+        decoration: BoxDecoration(
+          color: focused ? Colors.white12 : Colors.transparent,
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: focused ? Colors.white30 : Colors.transparent, width: 1),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, color: Colors.white, size: 18),
+            const SizedBox(width: 6),
+            Text(
+              label,
+              style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   // ── Visual helper: focused circle button ─────────────────────────────────────
   Widget _circleBtn({
     required _MZone zone,
     required Widget icon,
-    double size = 52,
+    double size = 44,
+    bool hasBg = true,
     Color? defaultBg,
   }) {
     final focused = _zone == zone;
@@ -839,13 +1153,21 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
       height: size,
       decoration: BoxDecoration(
         shape: BoxShape.circle,
-        color: focused ? AppColors.accent : (defaultBg ?? Colors.black.withValues(alpha: 0.65)),
+        color: focused
+            ? (zone == _MZone.play ? Colors.transparent : Colors.white.withValues(alpha: 0.24))
+            : (defaultBg ?? (hasBg ? Colors.white.withValues(alpha: 0.12) : Colors.transparent)),
         border: Border.all(
-          color: focused ? Colors.white : Colors.white24,
-          width: focused ? 2.5 : 1.5,
+          color: focused ? Colors.white : (hasBg ? Colors.white30 : Colors.transparent),
+          width: focused ? 2.0 : 1.0,
         ),
         boxShadow: focused
-            ? [BoxShadow(color: AppColors.accent.withValues(alpha: 0.55), blurRadius: 18, spreadRadius: 2)]
+            ? [
+                BoxShadow(
+                  color: Colors.white.withValues(alpha: 0.4),
+                  blurRadius: 18,
+                  spreadRadius: 2,
+                )
+              ]
             : null,
       ),
       child: Center(child: icon),
@@ -886,11 +1208,16 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
     final isFav = appState.isFavorite(_currentItem.id);
     _buildSuggestions(appState);
 
-    return Focus(
-      focusNode: _focus,
-      autofocus: true,
-      onKeyEvent: _onKey,
-      child: Scaffold(
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) _safeExit();
+      },
+      child: Focus(
+        focusNode: _focus,
+        autofocus: true,
+        onKeyEvent: _onKey,
+        child: Scaffold(
         backgroundColor: Colors.black,
         body: GestureDetector(
           behavior: HitTestBehavior.translucent,
@@ -907,67 +1234,17 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
             fit: StackFit.expand,
             children: [
 
-              // ── VIDEO ─────────────────────────────────────────────────
+              // ── VIDEO or OPAQUE LOADING SCREEN ──────────────────────────
+              // IMPORTANT: During loading we use a fully opaque black screen
+              // so the home screen never shows behind the player.
               if (_videoCtrl != null && !_loading)
                 Video(controller: _videoCtrl!, controls: NoVideoControls, fit: _videoFit)
               else
-                _thumbnail(_currentItem),
-
-              // ── LOADING ───────────────────────────────────────────────
-              if (_loading)
                 Container(
-                  color: Colors.black54,
-                  child: Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const CircularProgressIndicator(
-                          valueColor: AlwaysStoppedAnimation<Color>(AppColors.accent),
-                          strokeWidth: 3,
-                        ),
-                        const SizedBox(height: 16),
-                        Text('Loading ${_currentItem.title}…',
-                            style: const TextStyle(color: Colors.white70, fontSize: 14)),
-                      ],
-                    ),
-                  ),
+                  color: Colors.black,
                 ),
 
-              // ── RETRY ─────────────────────────────────────────────────
-              if (_autoRetrying)
-                Container(
-                  color: Colors.black87,
-                  child: Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const SizedBox(
-                          width: 28, height: 28,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2.5,
-                            valueColor: AlwaysStoppedAnimation<Color>(AppColors.accent),
-                          ),
-                        ),
-                        const SizedBox(height: 16),
-                        Text(
-                          'Attempt $_attemptNumber of $_maxAttempts — reconnecting in ${_retryCountdown}s…',
-                          style: const TextStyle(color: Colors.white70, fontSize: 14),
-                          textAlign: TextAlign.center,
-                        ),
-                        const SizedBox(height: 12),
-                        TextButton(
-                          onPressed: () {
-                            _retryTimer?.cancel();
-                            setState(() => _autoRetrying = false);
-                            _startPlay();
-                          },
-                          child: const Text('Retry Now',
-                              style: TextStyle(color: AppColors.accent, fontSize: 14)),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
+              // Fullscreen loading/retry overlays removed to prevent text overlap in the background
 
               // ── STREAM DEAD ───────────────────────────────────────────
               if (_streamDead)
@@ -985,7 +1262,12 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
                                 fontWeight: FontWeight.w700)),
                         const SizedBox(height: 8),
                         Text(
-                          '${_currentItem.title} could not be loaded\nafter $_maxAttempts attempts.',
+                          // _attemptNumber == 0 means we never retried: the
+                          // provider said "not there", so say that plainly
+                          // rather than claiming attempts that never happened.
+                          _attemptNumber == 0
+                              ? '${_currentItem.title} is not available\nfrom your provider right now.'
+                              : '${_currentItem.title} could not be loaded\nafter $_maxAttempts attempts.',
                           textAlign: TextAlign.center,
                           style: const TextStyle(color: Colors.white54, fontSize: 13, height: 1.5),
                         ),
@@ -1005,8 +1287,7 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
                         const SizedBox(height: 12),
                         TextButton(
                           onPressed: () {
-                            _player?.pause();
-                            Navigator.of(context).pop();
+                            _safeExit();
                           },
                           child: const Text('Go Back',
                               style: TextStyle(color: Colors.white54, fontSize: 13)),
@@ -1053,55 +1334,7 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
                           ),
                         ),
                       ),
-                      // Title area (no interaction needed)
-                      Positioned(
-                        top: 0, left: 0, right: 0,
-                        child: SafeArea(
-                          bottom: false,
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                            child: Row(
-                              children: [
-                                // Back placeholder (not interactive here)
-                                const SizedBox(width: 44),
-                                const SizedBox(width: 10),
-                                if (_currentItem.imageUrl.isNotEmpty) ...[
-                                  ClipRRect(
-                                    borderRadius: BorderRadius.circular(6),
-                                    child: CachedNetworkImage(
-                                      imageUrl: _currentItem.imageUrl,
-                                      width: 36, height: 50,
-                                      fit: BoxFit.cover,
-                                      errorWidget: (_, __, ___) => const SizedBox.shrink(),
-                                    ),
-                                  ),
-                                  const SizedBox(width: 10),
-                                ],
-                                Expanded(
-                                  child: Column(
-                                    mainAxisSize: MainAxisSize.min,
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      Text(_currentItem.title,
-                                          style: const TextStyle(color: Colors.white, fontSize: 17,
-                                              fontWeight: FontWeight.w700),
-                                          maxLines: 1, overflow: TextOverflow.ellipsis),
-                                      if (_currentItem.year != null) ...[
-                                        const SizedBox(height: 2),
-                                        Text(
-                                          '${_currentItem.year}'
-                                          '${_currentItem.genre != null ? '  \u2022  ${_currentItem.genre}' : ''}',
-                                          style: const TextStyle(color: Colors.white60, fontSize: 11),
-                                        ),
-                                      ],
-                                    ],
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
+
                     ],
                   ),
                 ),
@@ -1115,76 +1348,172 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
                   ignoring: !_showOverlay, // block touches only when hidden
                   child: ExcludeFocus(
                     excluding: true, // root _focus handles all key events
+                    // FIX #12 — video and gradients stay full-bleed;
+                    // only the controls move inside the overscan margin.
+                    child: TvSafeArea(
                     child: Stack(
                       fit: StackFit.expand,
                       children: [
 
-                        // ── TOP BAR: Back + Fav (large 48dp touch targets) ────
+                        // ── TOP BAR: Back, Cast, Lock, Fav, Settings ────
                         Positioned(
                           top: 0, left: 0, right: 0,
                           child: SafeArea(
                             bottom: false,
                             child: Padding(
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                               child: Row(
                                 children: [
-                                  // Back button — larger touch target
-                                  GestureDetector(
-                                    behavior: HitTestBehavior.opaque,
-                                    onTap: () {
-                                      _player?.pause();
-                                      Navigator.of(context).pop();
-                                    },
-                                    child: Padding(
-                                      padding: const EdgeInsets.all(8),
+                                  // Back button
+                                  if (!_controlsLocked)
+                                    GestureDetector(
+                                      behavior: HitTestBehavior.opaque,
+                                      onTap: () {
+                                        _safeExit();
+                                      },
                                       child: _circleBtn(
                                         zone: _MZone.back,
-                                        size: 44,
-                                        icon: const Icon(Icons.arrow_back_ios_new, color: Colors.white, size: 20),
+                                        size: 40,
+                                        icon: const Icon(Icons.arrow_back, color: Colors.white, size: 20),
+                                        hasBg: true,
                                       ),
                                     ),
+                                  const SizedBox(width: 12),
+                                  // Title text
+                                  Expanded(
+                                    child: Text(
+                                      _currentItem.title,
+                                      style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold, fontFamily: 'Outfit'),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
                                   ),
-                                  const Spacer(),
-                                  // Fav button — larger touch target
+                                  // Lock button (always visible so user can unlock)
                                   GestureDetector(
                                     behavior: HitTestBehavior.opaque,
                                     onTap: () {
-                                      appState.toggleFavorite(_currentItem);
-                                      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                                        content: Text(
-                                          appState.isFavorite(_currentItem.id)
-                                              ? 'Added to My List'
-                                              : 'Removed from My List',
-                                          style: const TextStyle(color: Colors.white),
-                                        ),
-                                        backgroundColor: AppColors.bg4,
-                                        duration: const Duration(seconds: 2),
-                                      ));
-                                      setState(() {});
-                                      _resetHideTimer();
+                                      setState(() {
+                                        _controlsLocked = !_controlsLocked;
+                                      });
+                                      _showOverlayFor4s();
                                     },
                                     child: Padding(
-                                      padding: const EdgeInsets.all(8),
+                                      padding: const EdgeInsets.symmetric(horizontal: 4),
                                       child: _circleBtn(
-                                        zone: _MZone.fav,
-                                        size: 44,
-                                        icon: Icon(
-                                          isFav ? Icons.favorite : Icons.favorite_border,
-                                          color: (_zone == _MZone.fav)
-                                              ? Colors.white
-                                              : (isFav ? AppColors.accent : Colors.white),
-                                          size: 22,
-                                        ),
+                                        zone: _MZone.lock,
+                                        size: 40,
+                                        icon: Icon(_controlsLocked ? Icons.lock : Icons.lock_open, color: Colors.white, size: 20),
+                                        hasBg: _controlsLocked,
                                       ),
                                     ),
                                   ),
+                                  if (!_controlsLocked) ...[
+                                    const SizedBox(width: 8),
+                                    // Fav button
+                                    GestureDetector(
+                                      behavior: HitTestBehavior.opaque,
+                                      onTap: () {
+                                        appState.toggleFavorite(_currentItem);
+                                        _showOverlayFor4s();
+                                      },
+                                      child: Padding(
+                                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                                        child: _circleBtn(
+                                          zone: _MZone.fav,
+                                          size: 40,
+                                          icon: Icon(isFav ? Icons.favorite : Icons.favorite_border, color: Colors.white, size: 20),
+                                          hasBg: true,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    // Settings button
+                                    GestureDetector(
+                                      behavior: HitTestBehavior.opaque,
+                                      onTap: _showSettingsMenu,
+                                      child: Padding(
+                                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                                        child: _circleBtn(
+                                          zone: _MZone.settings,
+                                          size: 40,
+                                          icon: const Icon(Icons.settings, color: Colors.white, size: 20),
+                                          hasBg: true,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
                                 ],
                               ),
                             ),
                           ),
                         ),
 
-                        // ── BOTTOM: controls + progress + suggestions ──────────
+                        // ── CENTER PLAYBACK CONTROLS ────
+                        if (!_controlsLocked && !_streamDead)
+                          Positioned.fill(
+                            child: Center(
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                // -10s
+                                GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
+                                  onTap: () {
+                                    if (_player != null) _seekTo(_player!.state.position - const Duration(seconds: 10));
+                                    _showOverlayFor4s();
+                                  },
+                                  child: Padding(
+                                    padding: const EdgeInsets.all(8),
+                                    child: _circleBtn(
+                                      zone: _MZone.replay,
+                                      icon: const Icon(Icons.replay_10, color: Colors.white, size: 32),
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 16),
+                                // Play/Pause
+                                GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
+                                  onTap: () {
+                                    _togglePlay();
+                                    _showOverlayFor4s();
+                                  },
+                                  child: Padding(
+                                    padding: const EdgeInsets.all(8),
+                                    child: _circleBtn(
+                                      zone: _MZone.play,
+                                      size: 72,
+                                      defaultBg: Colors.transparent,
+                                      // FIX #6 — one glyph driven by the state
+                                      // enum, cross-faded, fixed size so the
+                                      // button never shifts.
+                                      icon: playPauseGlyph(_uiState),
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 16),
+                                // +10s
+                                GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
+                                  onTap: () {
+                                    if (_player != null) _seekTo(_player!.state.position + const Duration(seconds: 10));
+                                    _showOverlayFor4s();
+                                  },
+                                  child: Padding(
+                                    padding: const EdgeInsets.all(8),
+                                    child: _circleBtn(
+                                      zone: _MZone.forward,
+                                      icon: const Icon(Icons.forward_10, color: Colors.white, size: 32),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+
+                        // ── BOTTOM: progress + action row ──────────
                         Positioned(
                           bottom: 0, left: 0, right: 0,
                           child: SafeArea(
@@ -1196,83 +1525,6 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
 
-                                  // ── Playback controls row (large touch targets) ──
-                                  Center(
-                                    child: Row(
-                                      mainAxisAlignment: MainAxisAlignment.center,
-                                      mainAxisSize: MainAxisSize.min,
-                                      children: [
-                                        // -10s
-                                        GestureDetector(
-                                          behavior: HitTestBehavior.opaque,
-                                          onTap: () {
-                                            if (_player != null) _seekTo(_player!.state.position - const Duration(seconds: 10));
-                                            _showOverlayFor4s();
-                                          },
-                                          child: Padding(
-                                            padding: const EdgeInsets.all(8),
-                                            child: _circleBtn(
-                                              zone: _MZone.replay,
-                                              icon: const Icon(Icons.replay_10, color: Colors.white, size: 28),
-                                            ),
-                                          ),
-                                        ),
-                                        const SizedBox(width: 16),
-                                        // Play/Pause
-                                        GestureDetector(
-                                          behavior: HitTestBehavior.opaque,
-                                          onTap: () {
-                                            _togglePlay();
-                                            _showOverlayFor4s();
-                                          },
-                                          child: AnimatedContainer(
-                                            duration: const Duration(milliseconds: 150),
-                                            width: 72, height: 72,
-                                            decoration: BoxDecoration(
-                                              shape: BoxShape.circle,
-                                              color: _zone == _MZone.play ? Colors.white : AppColors.accent,
-                                              border: Border.all(
-                                                color: _zone == _MZone.play ? AppColors.accent : Colors.transparent,
-                                                width: 3,
-                                              ),
-                                              boxShadow: [
-                                                BoxShadow(
-                                                  color: AppColors.accent.withValues(alpha: _zone == _MZone.play ? 0.7 : 0.4),
-                                                  blurRadius: _zone == _MZone.play ? 24 : 14,
-                                                  spreadRadius: 2,
-                                                ),
-                                              ],
-                                            ),
-                                            child: Center(
-                                              child: Icon(
-                                                _playing ? Icons.pause : Icons.play_arrow,
-                                                color: _zone == _MZone.play ? AppColors.accent : Colors.white,
-                                                size: 40,
-                                              ),
-                                            ),
-                                          ),
-                                        ),
-                                        const SizedBox(width: 16),
-                                        // +10s
-                                        GestureDetector(
-                                          behavior: HitTestBehavior.opaque,
-                                          onTap: () {
-                                            if (_player != null) _seekTo(_player!.state.position + const Duration(seconds: 10));
-                                            _showOverlayFor4s();
-                                          },
-                                          child: Padding(
-                                            padding: const EdgeInsets.all(8),
-                                            child: _circleBtn(
-                                              zone: _MZone.forward,
-                                              icon: const Icon(Icons.forward_10, color: Colors.white, size: 28),
-                                            ),
-                                          ),
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-
-                                  const SizedBox(height: 12),
 
                                   // ── Seekable progress bar ──────────────────────
                                   // Supports tap-to-seek AND drag-to-scrub on phone
@@ -1362,7 +1614,7 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
                                                       child: Container(
                                                         height: isActive ? 10 : 5,
                                                         decoration: BoxDecoration(
-                                                          color: AppColors.accent,
+                                                          color: isActive ? AppColors.accent : Colors.white,
                                                           borderRadius: BorderRadius.circular(6),
                                                           boxShadow: isActive
                                                               ? [BoxShadow(
@@ -1404,57 +1656,35 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
                                       ),
                                     ],
                                   ),
-
-                                  const SizedBox(height: 10),
-
-                                  // ── More movies suggestions ──────────────────
-                                  if (_suggestions.isNotEmpty) ...[
-                                    const Text('More Movies',
-                                        style: TextStyle(color: Colors.white, fontSize: 13,
-                                            fontWeight: FontWeight.bold, fontFamily: 'Inter')),
-                                    const SizedBox(height: 8),
-                                    SizedBox(
-                                      height: 155,
-                                      child: ListView.separated(
-                                        controller: _suggScroll,
-                                        scrollDirection: Axis.horizontal,
-                                        itemCount: _suggestions.length,
-                                        separatorBuilder: (_, __) => const SizedBox(width: 10),
-                                        itemBuilder: (ctx, i) {
-                                          final item = _suggestions[i];
-                                          final focused = _zone == _MZone.suggestions && _suggestionIdx == i;
-                                          return GestureDetector(
-                                            behavior: HitTestBehavior.opaque,
-                                            onTap: () {
-                                              _player?.pause();
-                                              Navigator.pushReplacement(context,
-                                                  MaterialPageRoute(builder: (_) => MoviePlayerScreen(item: item)));
-                                            },
-                                            child: AnimatedContainer(
-                                              duration: const Duration(milliseconds: 150),
-                                              width: 95,
-                                              decoration: BoxDecoration(
-                                                borderRadius: BorderRadius.circular(8),
-                                                border: Border.all(
-                                                  color: focused ? AppColors.accent : Colors.white12,
-                                                  width: focused ? 2.5 : 1,
-                                                ),
-                                                boxShadow: focused
-                                                    ? [BoxShadow(
-                                                        color: AppColors.accent.withValues(alpha: 0.45),
-                                                        blurRadius: 14, spreadRadius: 1)]
-                                                    : null,
-                                              ),
-                                              child: ClipRRect(
-                                                borderRadius: BorderRadius.circular(7),
-                                                child: _MovieSuggCard(item: item),
-                                              ),
-                                            ),
-                                          );
-                                        },
-                                      ),
+                                  const SizedBox(height: 6),
+                                  // Action Row Below SeekBar
+                                  Center(
+                                    child: Row(
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      children: [
+                                        _bottomActionBtn(
+                                          zone: _MZone.aspectRatio,
+                                          icon: Icons.aspect_ratio,
+                                          label: 'Aspect Ratio',
+                                          onTap: _showAspectMenu,
+                                        ),
+                                        const SizedBox(width: 24),
+                                        _bottomActionBtn(
+                                          zone: _MZone.speed,
+                                          icon: Icons.speed,
+                                          label: 'Speed (${_playbackSpeed}x)',
+                                          onTap: _showSpeedMenu,
+                                        ),
+                                        const SizedBox(width: 24),
+                                        _bottomActionBtn(
+                                          zone: _MZone.subtitles,
+                                          icon: Icons.subtitles,
+                                          label: 'Subtitles',
+                                          onTap: _showSubtitlesMenu,
+                                        ),
+                                      ],
                                     ),
-                                  ],
+                                  ),
                                 ],
                               ),
                             ),
@@ -1462,6 +1692,7 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
                         ),
                       ],
                     ),
+                    ), // FIX #12 TvSafeArea
                   ),
                 ),
               ),
@@ -1517,7 +1748,8 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
           ),
         ),
       ),
-    );
+    ),
+   );
   }
 
   Widget _thumbnail(ContentItem item) {

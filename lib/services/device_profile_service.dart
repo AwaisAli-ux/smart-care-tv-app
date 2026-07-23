@@ -33,6 +33,11 @@ enum QualityTier { auto, uhd4k, fhd1080, hd720, sd480, low360 }
 /// Immutable snapshot of a device's capabilities and the optimal playback
 /// configuration derived from them. Created once at app startup.
 class DeviceProfile {
+  final String deviceId;
+  /// Android SERIAL number / hardware serial (may be 'unknown' on locked bootloaders)
+  final String hwSerial;
+  /// Human-readable display name: 'Google Pixel 7', 'Samsung Galaxy S24', etc.
+  final String displayName;
   final DeviceClass deviceClass;
   final String brand;
   final String manufacturer;
@@ -69,6 +74,9 @@ class DeviceProfile {
   final Map<String, String> streamHeaders;
 
   const DeviceProfile({
+    required this.deviceId,
+    required this.hwSerial,
+    required this.displayName,
     required this.deviceClass,
     required this.brand,
     required this.manufacturer,
@@ -109,16 +117,23 @@ class DeviceProfileService {
   DeviceProfileService._();
   static final DeviceProfileService instance = DeviceProfileService._();
 
-  static const _ch = MethodChannel('com.example.mbapp/device_info');
+  static const _ch = MethodChannel('com.smartcaretv.app/device_info');
 
   DeviceProfile? _profile;
   DeviceProfile get currentProfile => _profile ?? _genericFallbackProfile();
+
+  Future<DeviceProfile>? _detectFuture;
 
   // ── Public API ──────────────────────────────────────────────────────────────
 
   /// Queries the native Android channel for device capabilities and builds a
   /// [DeviceProfile]. Safe to call multiple times — returns cached result.
-  Future<DeviceProfile> detect() async {
+  Future<DeviceProfile> detect() {
+    _detectFuture ??= _doDetect();
+    return _detectFuture!;
+  }
+
+  Future<DeviceProfile> _doDetect() async {
     if (_profile != null) return _profile!;
     try {
       final raw = await _ch.invokeMapMethod<String, dynamic>('getDeviceInfo');
@@ -138,8 +153,15 @@ class DeviceProfileService {
   // ── Builder ─────────────────────────────────────────────────────────────────
 
   DeviceProfile _build(Map<String, dynamic> raw) {
-    final brand        = (raw['brand']        as String? ?? '').toLowerCase();
-    final manufacturer = (raw['manufacturer'] as String? ?? '').toLowerCase();
+    final deviceId     = raw['deviceId']     as String? ?? 'unknown';
+    final hwSerial     = raw['hwSerial']     as String? ?? 'unknown';
+    final isTv         = raw['isTv']         as bool?   ?? false;
+    // Keep original casing from native layer — no forced lowercase here.
+    // We lowercase only for classification comparisons, not for display.
+    final brandRaw        = raw['brand']        as String? ?? '';
+    final manufacturerRaw = raw['manufacturer'] as String? ?? '';
+    final brand        = brandRaw.toLowerCase();
+    final manufacturer = manufacturerRaw.toLowerCase();
     final model        = raw['model']        as String? ?? '';
     final osVersion    = raw['osVersion']    as String? ?? '';
     final sdkInt       = raw['sdkInt']       as int?    ?? 21;
@@ -159,7 +181,7 @@ class DeviceProfileService {
         [];
 
     // ── Classify device ────────────────────────────────────────────────────
-    final cls = _classifyDevice(brand, manufacturer, model);
+    final cls = _classifyDevice(brand, manufacturer, model, isTv);
 
     // ── Derive optimal settings from hardware ──────────────────────────────
 
@@ -171,7 +193,7 @@ class DeviceProfileService {
 
     // Amlogic latency hacks: Amlogic SoCs are used in: Xiaomi Mi Box,
     // most generic Chinese boxes, many Hisense/Skyworth/Haier internal chips.
-    final enableLatencyHacks = _isAmlogicLikely(cls, brand, manufacturer, model);
+    final enableLatencyHacks = _isAmlogicLikely(cls, brand, manufacturer, model, isTv);
 
     // Hardware acceleration: only safe on Qualcomm (Snapdragon) and Nvidia Tegra.
     // Amlogic, Rockchip, MediaTek, Mali GPU cause scrambled/green video with HW decoding.
@@ -187,7 +209,18 @@ class DeviceProfileService {
     // Stream headers — UA + Referer for this device
     final headers = _buildHeaders(ua);
 
+    // Build a clean display name: prefer proper-cased manufacturer + model.
+    // If manufacturer is already part of the model string, skip it to avoid
+    // duplication (e.g. model="Samsung Galaxy S24" + manufacturer="Samsung").
+    final mfrDisplay  = _toTitleCase(manufacturerRaw);
+    final displayName = model.toLowerCase().contains(mfrDisplay.toLowerCase())
+        ? model
+        : '$mfrDisplay $model'.trim();
+
     return DeviceProfile(
+      deviceId: deviceId,
+      hwSerial: hwSerial,
+      displayName: displayName,
       deviceClass: cls,
       brand: brand,
       manufacturer: manufacturer,
@@ -214,18 +247,45 @@ class DeviceProfileService {
     );
   }
 
+  /// Title-case a string: 'google' → 'Google', 'SAMSUNG' → 'Samsung'
+  String _toTitleCase(String s) {
+    if (s.isEmpty) return s;
+    return s[0].toUpperCase() + s.substring(1).toLowerCase();
+  }
+
   // ── Classification ──────────────────────────────────────────────────────────
 
-  DeviceClass _classifyDevice(String brand, String manufacturer, String model) {
+  DeviceClass _classifyDevice(String brand, String manufacturer, String model, bool isTv) {
     final m = model.toLowerCase();
     final b = brand;
     final mfr = manufacturer;
+
+    // Nvidia Shield, Amazon Fire TV, and Roku are TV-only product lines — safe
+    // to brand-match regardless of isTv (these manufacturers don't ship phones
+    // under these model families).
+    if (b.contains('nvidia') || mfr.contains('nvidia') || m.contains('shield')) {
+      return DeviceClass.nvidia;
+    }
+    if (b.contains('amazon') || mfr.contains('amazon') ||
+        m.contains('aft') || m.contains('fire tv') || m.contains('firetv')) {
+      return DeviceClass.fireTv;
+    }
+    if (b.contains('roku') || mfr.contains('roku')) return DeviceClass.roku;
+
+    // Everything below matches brands that ALSO sell phones/tablets
+    // (Samsung, LG, Sony, Xiaomi, TCL, Philips, Panasonic, Sharp, ...).
+    // Only trust the brand-name match when the native side confirmed this is
+    // actually TV hardware (UiModeManager / leanback feature) — otherwise a
+    // real Galaxy/Xperia/Redmi phone gets misclassified as a Smart TV, which
+    // sends it a bogus Tizen/Bravia User-Agent and TV-only mpv quirks
+    // (video-latency-hacks etc.) that real phones never asked for.
+    if (!isTv) return DeviceClass.generic;
 
     if (b.contains('samsung') || mfr.contains('samsung')) return DeviceClass.samsung;
     if (b.contains('lg') || mfr.contains('lg')) return DeviceClass.lg;
     if (b.contains('sony') || mfr.contains('sony')) return DeviceClass.sony;
 
-    // Xiaomi / Mi — covers Mi Box S, Mi TV Stick, Poco, Redmi
+    // Xiaomi / Mi — covers Mi Box S, Mi TV Stick
     if (b.contains('xiaomi') || b.contains('mi') || mfr.contains('xiaomi') ||
         m.contains('mi box') || m.contains('mi tv') || m.contains('mibox') ||
         m.contains('mi stick')) {
@@ -243,22 +303,8 @@ class DeviceProfileService {
     if (b.contains('skyworth') || mfr.contains('skyworth')) return DeviceClass.skyworth;
     if (b.contains('toshiba') || mfr.contains('toshiba')) return DeviceClass.toshiba;
 
-    // Roku — their Android builds report "Roku" as brand
-    if (b.contains('roku') || mfr.contains('roku')) return DeviceClass.roku;
-
-    // Amazon Fire TV — brand="Amazon" or model contains "AFTT","AFTN","AFTM","AFTB"
-    if (b.contains('amazon') || mfr.contains('amazon') ||
-        m.contains('aft') || m.contains('fire tv') || m.contains('firetv')) {
-      return DeviceClass.fireTv;
-    }
-
     // Apple TV — would only appear in a non-Flutter path; included for completeness
     if (b.contains('apple') || mfr.contains('apple')) return DeviceClass.appleTV;
-
-    // Nvidia Shield
-    if (b.contains('nvidia') || mfr.contains('nvidia') || m.contains('shield')) {
-      return DeviceClass.nvidia;
-    }
 
     // Google/ADT/Chromecast = Android TV
     if (b.contains('google') || mfr.contains('google') ||
@@ -271,7 +317,12 @@ class DeviceProfileService {
   }
 
   // ── Amlogic detection ───────────────────────────────────────────────────────
-  bool _isAmlogicLikely(DeviceClass cls, String brand, String manufacturer, String model) {
+  bool _isAmlogicLikely(DeviceClass cls, String brand, String manufacturer, String model, bool isTv) {
+    // Real phones (isTv=false) also fall into DeviceClass.generic when their
+    // brand isn't matched — never treat a phone as Amlogic-likely, since
+    // video-latency-hacks is an Amlogic TV SoC quirk that phone GPUs/decoders
+    // (Snapdragon, Exynos, MediaTek) never asked for and can misbehave with.
+    if (!isTv) return false;
     // Classes whose mainstream products use Amlogic SoCs
     if (cls == DeviceClass.mi || cls == DeviceClass.generic ||
         cls == DeviceClass.hisense || cls == DeviceClass.skyworth ||
@@ -288,15 +339,9 @@ class DeviceProfileService {
 
   // ── HW accel safety ─────────────────────────────────────────────────────────
   bool _isHwAccelSafe(DeviceClass cls, String brand, String manufacturer) {
-    // Qualcomm Snapdragon (Samsung flagship, Sony) and Nvidia Tegra are
-    // safe for hardware decoding. Everything else risks scrambled video.
-    if (cls == DeviceClass.nvidia) return true;
-    if (cls == DeviceClass.samsung || cls == DeviceClass.sony) {
-      // Only flagship Samsung/Sony use Snapdragon — mid/low range use Exynos/MediaTek
-      // Conservative: leave HW accel OFF by default; user can enable in Settings
-      return false;
-    }
-    return false; // Safe universal default: always SW decode
+    // Hardware acceleration via MediaCodec with auto-safe software fallback is safe
+    // on all Android devices and essential for smooth 60fps live streaming.
+    return true;
   }
 
   // ── Buffer from RAM ─────────────────────────────────────────────────────────
@@ -401,7 +446,10 @@ class DeviceProfileService {
   DeviceProfile _genericFallbackProfile() {
     const ua = 'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 '
         '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
-    return const DeviceProfile(
+    return DeviceProfile(
+      deviceId: 'unknown',
+      hwSerial: 'unknown',
+      displayName: 'Android Device',
       deviceClass: DeviceClass.generic,
       brand: 'generic',
       manufacturer: 'generic',

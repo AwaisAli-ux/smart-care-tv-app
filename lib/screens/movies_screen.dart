@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-
 import '../services/app_state.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
@@ -18,10 +17,6 @@ class MoviesScreen extends StatelessWidget {
     if (isLoading && movies.isEmpty) {
       return Scaffold(
         backgroundColor: AppColors.bg,
-        appBar: AppBar(
-          title: const Text('Movies'),
-          backgroundColor: AppColors.bg2,
-        ),
         body: const Center(
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -40,34 +35,50 @@ class MoviesScreen extends StatelessWidget {
       );
     }
 
-    if (movies.isEmpty) {
+    if (!isLoading && movies.isEmpty) {
       return Scaffold(
         backgroundColor: AppColors.bg,
-        appBar: AppBar(
-          title: const Text('Movies'),
-          backgroundColor: AppColors.bg2,
-        ),
-        body: const Center(
+        body: Center(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(Icons.movie, color: AppColors.textTertiary, size: 48),
-              SizedBox(height: 16),
-              Text('No movies available',
-                  style:
-                      TextStyle(color: AppColors.textSecondary, fontSize: 14)),
+              const Icon(Icons.movie_outlined, color: AppColors.textTertiary, size: 64),
+              const SizedBox(height: 20),
+              const Text(
+                'No Movies Found',
+                style: TextStyle(
+                  color: AppColors.textPrimary,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Movies will appear here once loaded.\nCheck your connection or try refreshing.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: AppColors.textSecondary, fontSize: 13, height: 1.5),
+              ),
+              const SizedBox(height: 24),
+              ElevatedButton.icon(
+                onPressed: () => appState.refreshContent(),
+                icon: const Icon(Icons.refresh, size: 18),
+                label: const Text('Refresh Content'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppColors.accent,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                ),
+              ),
             ],
           ),
         ),
       );
     }
 
+    final sorted = appState.sortedMovies;
+
     return Scaffold(
       backgroundColor: AppColors.bg,
-      appBar: AppBar(
-        title: const Text('Movies'),
-        backgroundColor: AppColors.bg2,
-      ),
       body: Column(
         children: [
           const SizedBox(height: 8),
@@ -75,8 +86,9 @@ class MoviesScreen extends StatelessWidget {
             // autoFocusFirst is intentionally false — focus only enters
             // the grid when the user presses Right/Enter on the sidebar.
             child: ContentGrid(
-              items: movies,
+              items: sorted,
               autoFocusFirst: false,
+              restorationKey: 'movies', // FIX #7
             ),
           ),
         ],

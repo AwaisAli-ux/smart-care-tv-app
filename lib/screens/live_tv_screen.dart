@@ -21,10 +21,6 @@ class LiveTvScreen extends StatelessWidget {
     if (isLoading && channels.isEmpty) {
       return Scaffold(
         backgroundColor: AppColors.bg,
-        appBar: AppBar(
-          title: const Text('Live TV'),
-          backgroundColor: AppColors.bg2,
-        ),
         body: const Center(
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -45,10 +41,6 @@ class LiveTvScreen extends StatelessWidget {
     if (channels.isEmpty) {
       return Scaffold(
         backgroundColor: AppColors.bg,
-        appBar: AppBar(
-          title: const Text('Live TV'),
-          backgroundColor: AppColors.bg2,
-        ),
         body: const Center(
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -65,10 +57,6 @@ class LiveTvScreen extends StatelessWidget {
 
     return Scaffold(
       backgroundColor: AppColors.bg,
-      appBar: AppBar(
-        title: const Text('Live TV'),
-        backgroundColor: AppColors.bg2,
-      ),
       body: Column(
         children: [
           const SizedBox(height: 8),
@@ -78,6 +66,7 @@ class LiveTvScreen extends StatelessWidget {
             child: ChannelGrid(
               items: channels,
               autoFocusFirst: false,
+              restorationKey: 'live_tv', // FIX #7
             ),
           ),
         ],

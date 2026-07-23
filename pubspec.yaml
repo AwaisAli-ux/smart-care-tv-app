@@ -9,7 +9,7 @@ publish_to: 'none'
 
 # App version: shown in Settings screen and app stores
 # Format: major.minor.patch+buildNumber
-version: 2.5.1+2
+version: 2.7.0+10
 
 # ─── SDK Constraints ──────────────────────────────────────────────────────────
 environment:
@@ -40,6 +40,7 @@ dependencies:
   # Loads + caches network images on device — shows shimmer while loading
   # Used in: channel cards, movie posters, hero banner, login wall
   cached_network_image: ^3.3.1
+  flutter_cache_manager: ^3.3.1
 
   # ── Video Player ───────────────────────────────────────────────────────────
   # media_kit uses libmpv/FFmpeg — supports ALL codecs including:
@@ -90,10 +91,9 @@ dev_dependencies:
 flutter_launcher_icons:
   android: true
   ios: true
-  image_path: "assets/images/app_logo_square.png"
-  # Adaptive icon: white background matches the logo's own white background
-  adaptive_icon_background: "#FFFFFF"
-  adaptive_icon_foreground: "assets/images/app_logo_square.png"
+  image_path: "assets/icon_512_dot.png"
+  adaptive_icon_background: "#000000"
+  adaptive_icon_foreground: "assets/icon_512_dot.png"
   min_sdk_android: 21
 
 # ─── Flutter Section ──────────────────────────────────────────────────────────

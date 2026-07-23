@@ -77,6 +77,7 @@ class ContentItem {
         return 'SERIES';
     }
   }
+
 }
 
 // ── Episode model for series ───────────────────────────────────────────────

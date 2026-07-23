@@ -1,0 +1,7 @@
+# Only the two PHP endpoints are reachable; block directory listing and
+# any accidental config include from being served from this folder.
+Options -Indexes
+
+<FilesMatch "\.(sql|log|md)$">
+    Require all denied
+</FilesMatch>

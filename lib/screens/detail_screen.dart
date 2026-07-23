@@ -5,16 +5,23 @@ import 'package:provider/provider.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import '../core/focus/dpad_scroll_helper.dart';
+import '../core/player/safe_dispose.dart';
+import '../core/widgets/tv_safe_area.dart';
 import '../models/content_model.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common_widgets.dart';
 import '../widgets/tv_focus.dart';
 import '../services/app_state.dart';
 import '../services/iptv_service.dart';
+import '../services/device_profile_service.dart';
+import '../services/player_factory.dart';
+import 'episode_player_screen.dart';
+import '../utils/player_navigation.dart';
 
 /// Native method channel to control Android AudioManager.
 /// Requests audio focus and raises media volume before any stream plays.
-const _audioChannel = MethodChannel('com.example.mbapp/audio');
+const _audioChannel = MethodChannel('com.smartcaretv.app/audio');
 
 class DetailScreen extends StatefulWidget {
   final ContentItem item;
@@ -34,6 +41,7 @@ class _DetailScreenState extends State<DetailScreen> {
   int  _retryCountdown = 0;       // seconds until next retry
   Timer? _volumeTimer;            // repeating timer to enforce unmuted audio
   String? _playerError;
+  bool _startingPlay = false;     // guards against overlapping _startPlay() calls
   Player? _player;
   VideoController? _videoController;
 
@@ -51,16 +59,41 @@ class _DetailScreenState extends State<DetailScreen> {
   Timer? _hideControlsTimer;
   Duration _position = Duration.zero;
   Duration _duration = Duration.zero;
-  double _volume = 80.0;
+  double _volume = 100.0;
   bool _showVolumeBar = false;
   Timer? _hideVolumeTimer;
   bool _isFullscreen = false;
+  // Seek-drag state (finger scrubbing)
+  bool _draggingProgress = false;
+  Duration _dragPosition = Duration.zero;
+  // Suggestions auto-hide
+  bool _showSuggestions = true;
+  Timer? _hideSuggestionsTimer;
 
   // ── Episodes state ────────────────────────────────────────────
   bool _episodesLoading = false;
   List<SeasonInfo> _seasons = [];
   int _selectedSeason = 0;
   EpisodeInfo? _currentEpisode;
+
+  // FIX #7 (step 6) — one node per episode, keyed by streamId so it survives
+  // the season list being rebuilt. Lets us put focus back on the exact
+  // episode the user played when they come back from the episode player.
+  final Map<String, FocusNode> _episodeNodes = {};
+
+  FocusNode _episodeNodeFor(EpisodeInfo ep) => _episodeNodes.putIfAbsent(
+        ep.streamId,
+        () => FocusNode(debugLabel: 'Episode_${ep.streamId}'),
+      );
+
+  /// Index of the season containing [ep], or null if it isn't found.
+  int? _seasonIndexOf(EpisodeInfo ep) {
+    for (int i = 0; i < _seasons.length; i++) {
+      if (_seasons[i].episodes.any((e) => e.streamId == ep.streamId)) return i;
+    }
+    return null;
+  }
+
 
   static const _ua =
       'Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 '
@@ -83,13 +116,21 @@ class _DetailScreenState extends State<DetailScreen> {
     _volumeTimer?.cancel();
     _hideControlsTimer?.cancel();
     _hideVolumeTimer?.cancel();
+    _hideSuggestionsTimer?.cancel();
     _completedSub?.cancel();
     _positionSub?.cancel();
     _durationSub?.cancel();
     _playingSub?.cancel();
     _screenFocus.dispose();
     _playPauseFocus.dispose();
-    _player?.dispose();
+    for (final n in _episodeNodes.values) {
+      n.dispose(); // FIX #7 (step 6)
+    }
+    // Ordered teardown — a bare dispose() can delete the FFI callbacks while
+    // mpv is still delivering events, which aborts the process.
+    final p = _player;
+    _player = null;
+    if (p != null) Future.microtask(() => safeDisposePlayer(p));
     super.dispose();
   }
 
@@ -226,14 +267,53 @@ class _DetailScreenState extends State<DetailScreen> {
   }
 
   Future<void> _playEpisode(EpisodeInfo ep) async {
-    setState(() {
-      _currentEpisode = ep;
-      _playerError = null;
+    // Collect ALL episodes across all seasons for the suggestions list
+    final allEps = _seasons.expand((s) => s.episodes).toList();
+
+    await preRotateForPlayer();
+    if (!mounted) return;
+
+    // Navigate to the dedicated full-screen episode player
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => EpisodePlayerScreen(
+          series: widget.item,
+          episode: ep,
+          allEpisodes: allEps,
+        ),
+      ),
+    );
+    // Restore orientation when returning to the detail screen
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual,
+        overlays: SystemUiOverlay.values);
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+      DeviceOrientation.landscapeLeft,
+      DeviceOrientation.landscapeRight,
+    ]);
+
+    // FIX #7 (step 6) — land back on the episode that was just played, with
+    // its season selected. The player may have advanced to a later episode in
+    // a different season, so resolve the season from the episode itself.
+    if (!mounted) return;
+    final seasonIdx = _seasonIndexOf(ep);
+    if (seasonIdx != null && seasonIdx != _selectedSeason) {
+      setState(() => _selectedSeason = seasonIdx);
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final node = _episodeNodes[ep.streamId];
+      if (node == null) return;
+      node.requestFocus();
+      final ctx = node.context;
+      if (ctx != null) DpadScroll.ensureVisible(ctx);
     });
-    await _startPlay(episode: ep);
   }
 
   Future<void> _startPlay({EpisodeInfo? episode}) async {
+    if (!mounted || _startingPlay) return;
+    _startingPlay = true;
     EpisodeInfo? ep = episode;
 
     if (widget.item.isSeries && ep == null && _currentEpisode == null) {
@@ -271,9 +351,13 @@ class _DetailScreenState extends State<DetailScreen> {
     _positionSub?.cancel();
     _durationSub?.cancel();
     _playingSub?.cancel();
-    _player?.dispose();
+    // Ordered teardown, same reason as in dispose().
+    final oldPlayer = _player;
     _videoController = null;
     _player = null;
+    if (oldPlayer != null) {
+      Future.microtask(() => safeDisposePlayer(oldPlayer));
+    }
 
     try {
       try {
@@ -284,113 +368,41 @@ class _DetailScreenState extends State<DetailScreen> {
       final state = context.read<AppState>();
       final urls = await _candidateUrls(state, episode: ep);
 
-      // Read player settings from AppState (persisted in SharedPreferences).
-      // CRITICAL: hardware accel defaults to OFF — software decoding is
-      // universally compatible across all TV chipsets (Amlogic, MediaTek,
-      // Qualcomm, Tegra). Hardware decoding causes scrambled video on many boxes.
-      final hwAccel = state.hardwareAccelEnabled;
+      final hwAccel  = state.hardwareAccelEnabled;
       final bufBytes = state.bufferBytes;
-      debugPrint('▶ [Detail] hwAccel=$hwAccel bufferBytes=${bufBytes ~/ (1024 * 1024)}MB');
+      final profile  = DeviceProfileService.instance.currentProfile;
+      final isLive   = widget.item.isLive;
 
-      final player = Player(
-        configuration: PlayerConfiguration(
-          bufferSize: bufBytes,
-        ),
+      debugPrint('▶ [Detail] hwAccel=$hwAccel bufferBytes=${bufBytes ~/ (1024 * 1024)}MB isLive=$isLive');
+
+      final streamHeaders = <String, String>{
+        'User-Agent' : _ua,
+        'Accept'     : '*/*',
+        'Connection' : 'keep-alive',
+        'Referer'    : '${IptvService.baseUrl}/',
+        'Icy-MetaData': '1',
+      };
+
+      // PlayerFactory fires all mpv properties concurrently (Future.wait)
+      // instead of 20+ sequential awaits — eliminates the ANR on Android.
+      final probeResult = await PlayerFactory.probe(
+        urls: urls,
+        bufBytes: bufBytes,
+        hwAccel: hwAccel,
+        profile: profile,
+        streamHeaders: streamHeaders,
+        isLive: isLive,
+        probeTimeout: const Duration(seconds: 15),
       );
-      final ctrl = VideoController(
-        player,
-        configuration: VideoControllerConfiguration(
-          enableHardwareAcceleration: hwAccel,
-        ),
-      );
 
-      bool ok = false;
-      String? lastError;
-      for (final url in urls) {
-        try {
-          debugPrint('▶ Trying: $url');
-
-          // Collect FIRST fatal error only — ignore non-fatal libmpv warnings
-          String? fatalError;
-          final errSub = player.stream.error.listen((err) {
-            if (fatalError == null && !_isNonFatalError(err)) {
-              fatalError = err;
-            }
-            debugPrint('⚠ [Detail] Stream error for $url: $err');
-          });
-
-          await player.open(
-            Media(url, httpHeaders: {
-              'User-Agent': _ua,
-              'Accept': '*/*',
-              'Connection': 'keep-alive',
-              'Referer': '${IptvService.baseUrl}/',
-              'Icy-MetaData': '1',
-            }),
-          );
-
-          // Success signals: width, duration, buffering true→false transition, or playing
-          final successCompleter = Completer<void>();
-          void succeed() {
-            if (!successCompleter.isCompleted) successCompleter.complete();
-          }
-
-          final widthSub = player.stream.width.listen((w) {
-            if (w != null && w > 0) succeed();
-          });
-          final durationSub = player.stream.duration.listen((d) {
-            if (d.inMilliseconds > 0) succeed();
-          });
-          // CRITICAL FIX: Track buffering=true first before accepting buffering=false.
-          // buffering=false fires immediately as the initial state (before any data),
-          // so naively calling succeed() on !buffering gives a false positive black screen.
-          bool _hasBufferedDetail = false;
-          final bufferingSub = player.stream.buffering.listen((buffering) {
-            if (buffering) {
-              _hasBufferedDetail = true;
-            } else if (_hasBufferedDetail) {
-              succeed(); // only succeed on true→false transition
-            }
-          });
-          final playingSub2 = player.stream.playing.listen((playing) {
-            if (playing) succeed();
-          });
-
-          // 10s per URL — fast enough to cycle through all fallback extensions quickly
-          final result = await Future.any([
-            successCompleter.future.then((_) => 'ok'),
-            Future.delayed(const Duration(seconds: 10)).then((_) => 'timeout'),
-          ]);
-
-          await widthSub.cancel();
-          await durationSub.cancel();
-          await bufferingSub.cancel();
-          await playingSub2.cancel();
-          await errSub.cancel();
-
-          if (result == 'timeout' || fatalError != null) {
-            final reason = fatalError ?? 'timeout after 10s';
-            debugPrint('✗ Failed $url: $reason');
-            lastError = reason;
-            continue;
-          }
-
-          ok = true;
-          break;
-        } catch (e) {
-          lastError = e.toString();
-          debugPrint('✗ Failed $url: $e');
-        }
+      if (probeResult == null) {
+        throw Exception('Stream unavailable. All URL formats failed.');
       }
 
-      if (!ok) {
-        throw Exception(lastError ?? 'Stream unavailable.\nAll URL formats failed.');
-      }
+      _player           = probeResult.player;
+      _videoController  = probeResult.controller;
 
-      _player = player;
-      _videoController = ctrl;
-
-      _completedSub = player.stream.completed.listen((done) {
+      _completedSub = probeResult.player.stream.completed.listen((done) {
         if (done && mounted) {
           if (widget.item.isLive) {
             Future.delayed(const Duration(seconds: 2), _startPlay);
@@ -400,20 +412,14 @@ class _DetailScreenState extends State<DetailScreen> {
         }
       });
 
-      _positionSub = player.stream.position.listen((p) {
-        if (mounted && _showControls) {
-          setState(() => _position = p);
-        }
+      _positionSub = probeResult.player.stream.position.listen((p) {
+        if (mounted) setState(() => _position = p);
       });
-      _durationSub = player.stream.duration.listen((d) {
-        if (mounted && _showControls) {
-          setState(() => _duration = d);
-        }
+      _durationSub = probeResult.player.stream.duration.listen((d) {
+        if (mounted) setState(() => _duration = d);
       });
-      _playingSub = player.stream.playing.listen((p) {
-        if (mounted) {
-          setState(() => _playing = p);
-        }
+      _playingSub = probeResult.player.stream.playing.listen((p) {
+        if (mounted) setState(() => _playing = p);
       });
 
       if (!mounted) return;
@@ -432,13 +438,46 @@ class _DetailScreenState extends State<DetailScreen> {
       });
 
       _startVolumeEnforcement();
+      _startingPlay = false;
     } catch (e) {
+      _startingPlay = false;
       if (!mounted) return;
       _scheduleAutoRetry();
     }
   }
 
 
+
+  /// Skip to the next episode in the series.
+  void _playNextEpisode() {
+    if (_seasons.isEmpty || _currentEpisode == null) return;
+    for (int sIdx = 0; sIdx < _seasons.length; sIdx++) {
+      final season = _seasons[sIdx];
+      final eps = season.episodes;
+      final epIdx = eps.indexWhere((e) => e.streamId == _currentEpisode!.streamId);
+      if (epIdx != -1) {
+        if (epIdx < eps.length - 1) {
+          _playEpisode(eps[epIdx + 1]);
+          return;
+        }
+        if (sIdx < _seasons.length - 1) {
+          final nextSeason = _seasons[sIdx + 1];
+          if (nextSeason.episodes.isNotEmpty) {
+            setState(() => _selectedSeason = sIdx + 1);
+            _playEpisode(nextSeason.episodes.first);
+            return;
+          }
+        }
+      }
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('This is the last episode'),
+        backgroundColor: Colors.black54,
+        duration: Duration(seconds: 2),
+      ),
+    );
+  }
 
   void _playNext() {
     final state = context.read<AppState>();
@@ -516,6 +555,7 @@ class _DetailScreenState extends State<DetailScreen> {
     if (!mounted) return;
     setState(() {
       _showControls = true;
+      _showSuggestions = true;
     });
     Future.microtask(() {
       if (mounted && !_playPauseFocus.hasFocus) {
@@ -523,13 +563,24 @@ class _DetailScreenState extends State<DetailScreen> {
       }
     });
     _resetHideControlsTimer();
+    _resetSuggestionsTimer();
+  }
+
+  void _resetSuggestionsTimer() {
+    _hideSuggestionsTimer?.cancel();
+    _hideSuggestionsTimer = Timer(const Duration(milliseconds: 1200), () {
+      if (mounted) setState(() => _showSuggestions = false);
+    });
   }
 
   void _resetHideControlsTimer() {
     _hideControlsTimer?.cancel();
     _hideControlsTimer = Timer(const Duration(seconds: 4), () {
       if (mounted && !_playerLoading && !_autoRetrying) {
-        setState(() => _showControls = false);
+        setState(() {
+          _showControls = false;
+          _showSuggestions = false;
+        });
         _screenFocus.requestFocus();
       }
     });
@@ -649,6 +700,502 @@ class _DetailScreenState extends State<DetailScreen> {
       );
     }
 
+    if (item.isSeries) {
+      return _buildSeriesDetailScreen(context, item, state, isFav, screenW);
+    }
+
+    return _buildDefaultDetailScreen(context, item, state, isFav, screenW);
+  }
+
+  Widget _buildSeriesDetailScreen(
+    BuildContext context,
+    ContentItem item,
+    AppState state,
+    bool isFav,
+    double screenW,
+  ) {
+    final currentEp = _currentEpisode ??
+        (_seasons.isNotEmpty && _seasons[_selectedSeason].episodes.isNotEmpty
+            ? _seasons[_selectedSeason].episodes.first
+            : null);
+
+    return LayoutBuilder(builder: (context, constraints) {
+      final isWide = constraints.maxWidth >= 600;
+      // FIX #12 — TvSafeArea now adds no inset (the target panels have no
+      // overscan), so this screen keeps its own breathing room.
+      final hPad = isWide ? 32.0 : 16.0;
+      final vPad = isWide ? 20.0 : 12.0;
+
+      return Scaffold(
+        backgroundColor: AppColors.bg,
+        body: SafeArea(
+          child: TvSafeArea(
+          child: SingleChildScrollView(
+            child: Padding(
+              padding: EdgeInsets.symmetric(horizontal: hPad, vertical: vPad),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // ── TOP BAR ─────────────────────────────────────────────
+                  Row(
+                    children: [
+                      TvFocusable(
+                        scaleOnFocus: true,
+                        borderRadius: 20,
+                        onActivate: () {
+                          _player?.pause();
+                          Navigator.pop(context);
+                        },
+                        child: Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: const BoxDecoration(
+                            color: AppColors.bg3,
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Icon(Icons.arrow_back, color: Colors.white, size: 22),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          '${item.title}${item.year != null ? "  (${item.year})" : ""}',
+                          overflow: TextOverflow.ellipsis,
+                          maxLines: 1,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: isWide ? 20 : 16,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      // FIX #8 — the 3-dots overflow icon that used to sit to
+                      // the right of this was removed. It was a bare Icon with
+                      // no menu and no handler, so it did nothing but take up
+                      // space. Favourite is now the last item in the row.
+                      TvFocusable(
+                        scaleOnFocus: true,
+                        onActivate: () => state.toggleFavorite(item),
+                        child: Icon(
+                          isFav ? Icons.favorite : Icons.favorite_border,
+                          color: isFav ? AppColors.accent : Colors.white54,
+                          size: 22,
+                        ),
+                      ),
+                    ],
+                  ),
+
+                  const SizedBox(height: 16),
+
+                  // ── CONTENT: Responsive poster + plot section ────────────
+                  if (isWide)
+                    // WIDE: side-by-side
+                    _buildWidePosterPlot(context, item, currentEp, isWide)
+                  else
+                    // PORTRAIT: stacked
+                    _buildPortraitPosterPlot(context, item, currentEp),
+
+                  const SizedBox(height: 16),
+
+                  // ── EPISODES HEADER ──────────────────────────────────────
+                  Text(
+                    'Episodes',
+                    style: const TextStyle(
+                      color: AppColors.accent,
+                      fontSize: 14,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  Container(height: 1, width: double.infinity, color: AppColors.border),
+                  const SizedBox(height: 12),
+
+                  // ── EPISODES CONTENT ─────────────────────────────────────
+                  _buildEpisodesTabContent(),
+                ],
+              ),
+            ),
+          ),
+          ),
+        ),
+      );
+    });
+  }
+
+  // Wide layout: poster on left, plot + actions on right
+  Widget _buildWidePosterPlot(BuildContext context, ContentItem item, EpisodeInfo? currentEp, bool isWide) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _buildPoster(item, width: 140, height: 190),
+        const SizedBox(width: 20),
+        Expanded(
+          child: SizedBox(
+            height: 190,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Plot:', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14)),
+                const SizedBox(height: 6),
+                Expanded(
+                  child: _buildPlotText(item),
+                ),
+                const SizedBox(height: 12),
+                _buildActionButtons(context, currentEp, wrapButtons: false),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // Portrait layout: poster + rating + plot stacked, then action buttons
+  Widget _buildPortraitPosterPlot(BuildContext context, ContentItem item, EpisodeInfo? currentEp) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _buildPoster(item, width: 110, height: 150),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Plot:', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13)),
+                  const SizedBox(height: 6),
+                  Text(
+                    item.description ?? 'No description available.',
+                    maxLines: 5,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: AppColors.textSecondary, fontSize: 12, height: 1.5),
+                  ),
+                  if (item.description != null && item.description!.length > 150) ...[
+                    const SizedBox(height: 4),
+                    GestureDetector(
+                      onTap: _showFullPlotDialog,
+                      child: const Text('Read more', style: TextStyle(color: AppColors.accent, fontWeight: FontWeight.bold, fontSize: 12)),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 14),
+        // Action buttons in portrait — wrap to next line if needed
+        _buildActionButtons(context, currentEp, wrapButtons: true),
+      ],
+    );
+  }
+
+  Widget _buildPoster(ContentItem item, {required double width, required double height}) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        ClipRRect(
+          borderRadius: BorderRadius.circular(10),
+          child: item.imageUrl.isNotEmpty
+              ? CachedNetworkImage(
+                  imageUrl: item.imageUrl,
+                  width: width,
+                  height: height,
+                  fit: BoxFit.cover,
+                  errorWidget: (_, __, ___) => _posterPlaceholder(width, height),
+                )
+              : _posterPlaceholder(width, height),
+        ),
+        const SizedBox(height: 8),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
+          children: List.generate(5, (index) {
+            final rating = item.rating ?? 0.0;
+            final starValue = rating > 5.0 ? rating / 2.0 : rating;
+            final isFilled = index < starValue.round();
+            return Icon(
+              isFilled ? Icons.star : Icons.star_border,
+              color: isFilled ? AppColors.gold : Colors.white24,
+              size: 15,
+            );
+          }),
+        ),
+      ],
+    );
+  }
+
+  Widget _posterPlaceholder(double w, double h) => Container(
+        width: w, height: h,
+        decoration: BoxDecoration(color: AppColors.bg3, borderRadius: BorderRadius.circular(10)),
+        child: const Icon(Icons.movie, color: Colors.white30, size: 48),
+      );
+
+  Widget _buildPlotText(ContentItem item) {
+    return SingleChildScrollView(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            item.description ?? 'No description available for this series.',
+            maxLines: 4,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(color: AppColors.textSecondary, fontSize: 13, height: 1.5),
+          ),
+          if (item.description != null && item.description!.length > 180) ...[
+            const SizedBox(height: 4),
+            TvFocusable(
+              scaleOnFocus: true,
+              onActivate: _showFullPlotDialog,
+              child: const Padding(
+                padding: EdgeInsets.symmetric(vertical: 2),
+                child: Text('Read more', style: TextStyle(color: AppColors.accent, fontWeight: FontWeight.bold, fontSize: 12)),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildActionButtons(BuildContext context, EpisodeInfo? currentEp, {required bool wrapButtons}) {
+    final playBtn = TvFocusable(
+      scaleOnFocus: true,
+      onActivate: () {
+        if (currentEp != null) {
+          _playEpisode(currentEp);
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+            content: Text('No episodes found for this series.'),
+            backgroundColor: Colors.red,
+          ));
+        }
+      },
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 11),
+        decoration: BoxDecoration(color: AppColors.accent, borderRadius: BorderRadius.circular(8)),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.play_arrow, color: Colors.white, size: 18),
+            const SizedBox(width: 6),
+            Text(
+              currentEp != null ? 'Play  S${currentEp.seasonNum}:E${currentEp.episodeNum}' : 'Play',
+              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 13),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    final seasonBtn = TvFocusable(
+      scaleOnFocus: true,
+      onActivate: _showSeasonPickerDialog,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+        decoration: BoxDecoration(
+          color: AppColors.bg3,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: AppColors.accent.withValues(alpha: 0.5)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              _seasons.isNotEmpty ? _seasons[_selectedSeason].label : 'Season 1',
+              style: const TextStyle(color: Colors.white, fontSize: 13),
+            ),
+            const SizedBox(width: 6),
+            const Icon(Icons.keyboard_arrow_down, color: AppColors.accent, size: 18),
+          ],
+        ),
+      ),
+    );
+
+    // FIX #8 — the "Watch Trailer" button is gone. It only ever opened a
+    // dialog saying no trailer was available, so removing it also removes a
+    // dead stop in the traversal order between Play and the episode list.
+
+    if (wrapButtons) {
+      return Wrap(
+        spacing: 10,
+        runSpacing: 10,
+        children: [playBtn, seasonBtn],
+      );
+    }
+
+    return Row(
+      children: [
+        playBtn,
+        const SizedBox(width: 10),
+        seasonBtn,
+      ],
+    );
+  }
+
+
+
+  Widget _buildEpisodesTabContent() {
+    if (_episodesLoading) {
+      return const Center(
+        child: CircularProgressIndicator(valueColor: AlwaysStoppedAnimation<Color>(AppColors.accent)),
+      );
+    }
+    if (_seasons.isEmpty) {
+      return const Center(
+        child: Text('No episodes available for this season.', style: TextStyle(color: AppColors.textTertiary)),
+      );
+    }
+    final episodes = _seasons[_selectedSeason].episodes;
+    return ListView.separated(
+      scrollDirection: Axis.vertical,
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      itemCount: episodes.length,
+      separatorBuilder: (_, __) => const SizedBox(height: 10),
+      itemBuilder: (ctx, i) {
+        final ep = episodes[i];
+        final isPlaying = _currentEpisode?.streamId == ep.streamId;
+        return _episodeRowItem(ep, isPlaying);
+      },
+    );
+  }
+
+  Widget _episodeRowItem(EpisodeInfo ep, bool isPlaying) {
+    return TvFocusable(
+      focusNode: _episodeNodeFor(ep), // FIX #7 (step 6)
+      scaleOnFocus: true,
+      onActivate: () => _playEpisode(ep),
+      child: Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: isPlaying ? AppColors.accent.withValues(alpha: 0.1) : AppColors.bg3,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: isPlaying ? AppColors.accent : AppColors.border,
+            width: isPlaying ? 1.5 : 1,
+          ),
+        ),
+        child: Row(
+          children: [
+            // Left Thumbnail with Play overlay
+            Stack(
+              alignment: Alignment.center,
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(6),
+                  child: ep.thumbnail != null && ep.thumbnail!.isNotEmpty
+                      ? CachedNetworkImage(
+                          imageUrl: ep.thumbnail!,
+                          width: 110,
+                          height: 65,
+                          fit: BoxFit.cover,
+                          errorWidget: (_, __, ___) => Container(
+                            width: 110, height: 65,
+                            color: AppColors.bg4,
+                            child: const Icon(Icons.movie_outlined, color: Colors.white24, size: 24),
+                          ),
+                        )
+                      : Container(
+                          width: 110, height: 65,
+                          decoration: const BoxDecoration(
+                            gradient: LinearGradient(
+                              colors: [Color(0xFF2C194D), Color(0xFF0F0721)],
+                              begin: Alignment.topLeft,
+                              end: Alignment.bottomRight,
+                            ),
+                          ),
+                          child: const Center(
+                            child: Icon(Icons.tv, color: Colors.white24, size: 24),
+                          ),
+                        ),
+                ),
+                // Circular play button overlay
+                Container(
+                  width: 28, height: 28,
+                  decoration: const BoxDecoration(
+                    color: Colors.white30,
+                    shape: BoxShape.circle,
+                  ),
+                  child: const Icon(Icons.play_arrow, color: Colors.white, size: 16),
+                ),
+              ],
+            ),
+            const SizedBox(width: 16),
+
+            // Middle Details Column
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    ep.title.isNotEmpty ? ep.title : '${widget.item.title} - S${ep.seasonNum.toString().padLeft(2, '0')}E${ep.episodeNum.toString().padLeft(2, '0')}',
+                    style: TextStyle(
+                      color: isPlaying ? AppColors.accent : Colors.white,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  // Star ratings row
+                  Row(
+                    children: List.generate(5, (index) => const Icon(Icons.star, color: Colors.white24, size: 13)),
+                  ),
+                  const SizedBox(height: 4),
+                  // Length
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: AppColors.bg4,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Text(
+                      ep.duration != null && ep.duration!.isNotEmpty ? ep.duration! : '0m',
+                      style: const TextStyle(color: Colors.white70, fontSize: 10),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+          ],
+        ),
+      ),
+    );
+  }
+
+
+
+  void _showFullPlotDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.bg3,
+        title: const Text('Plot Summary', style: TextStyle(color: Colors.white)),
+        content: Text(
+          widget.item.description ?? 'No description available.',
+          style: const TextStyle(color: Colors.white70, fontSize: 14, height: 1.5),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close', style: TextStyle(color: AppColors.accent)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // FIX #8 — _showTrailerUnavailableDialog removed along with its button.
+
+  Widget _buildDefaultDetailScreen(
+    BuildContext context,
+    ContentItem item,
+    AppState state,
+    bool isFav,
+    double screenW,
+  ) {
     return Focus(
       focusNode: _screenFocus,
       autofocus: true,
@@ -1021,6 +1568,7 @@ class _DetailScreenState extends State<DetailScreen> {
 
   Widget _episodeTile(EpisodeInfo ep, bool isPlaying) {
     return TvFocusable(
+      focusNode: _episodeNodeFor(ep), // FIX #7 (step 6)
       scaleOnFocus: true,
       onActivate: () => _playEpisode(ep),
       child: Container(
@@ -1240,6 +1788,11 @@ class _DetailScreenState extends State<DetailScreen> {
     required AppState state,
     required bool isFullscreen,
   }) {
+    final displayPos = _draggingProgress ? _dragPosition : _position;
+    final prog = _duration.inMilliseconds > 0
+        ? (displayPos.inMilliseconds / _duration.inMilliseconds).clamp(0.0, 1.0)
+        : 0.0;
+
     return AnimatedOpacity(
       opacity: _showControls ? 1.0 : 0.0,
       duration: const Duration(milliseconds: 300),
@@ -1248,236 +1801,337 @@ class _DetailScreenState extends State<DetailScreen> {
         child: Stack(
           fit: StackFit.expand,
           children: [
-            Positioned(
-              top: 0, left: 0, right: 0,
-              child: Container(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
-                decoration: const BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: [Color(0xDD000000), Colors.transparent],
-                  ),
-                ),
-                child: SafeArea(
-                  bottom: false,
-                  child: Row(
-                    children: [
-                      TvFocusable(
-                        isCircle: true,
-                        scaleOnFocus: true,
-                        onActivate: () {
-                          if (isFullscreen) {
-                            _toggleFullscreen();
-                          } else {
-                            _player?.pause();
-                            Navigator.of(context).pop();
-                          }
-                        },
-                        child: Container(
-                          width: 40, height: 40,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: Colors.black.withValues(alpha: 0.5),
-                          ),
-                          child: const Icon(Icons.arrow_back, color: Colors.white),
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Text(
-                              item.title,
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 16,
-                                fontWeight: FontWeight.bold,
-                              ),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                            if (item.genre != null || item.year != null)
-                              Text(
-                                '${item.year ?? ''} • ${item.genre ?? ''}',
-                                style: const TextStyle(color: Colors.white70, fontSize: 12),
-                              ),
-                          ],
-                        ),
-                      ),
-                      TvFocusable(
-                        isCircle: true,
-                        scaleOnFocus: true,
-                        onActivate: () {
-                          state.toggleFavorite(item);
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(
-                              content: Text(
-                                state.isFavorite(item.id)
-                                    ? 'Added to My List'
-                                    : 'Removed from My List',
-                              ),
-                              duration: const Duration(seconds: 2),
-                            ),
-                          );
-                        },
-                        child: Container(
-                          width: 40, height: 40,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: Colors.black.withValues(alpha: 0.5),
-                          ),
-                          child: Icon(
-                            isFav ? Icons.favorite : Icons.favorite_border,
-                            color: isFav ? AppColors.accent : Colors.white,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
+            // Full-area tap to show controls
+            Positioned.fill(
+              child: GestureDetector(
+                behavior: HitTestBehavior.translucent,
+                onTap: _showControlsTemporarily,
               ),
             ),
 
-            Align(
-              alignment: Alignment.center,
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  TvFocusable(
-                    isCircle: true,
-                    scaleOnFocus: true,
-                    onActivate: () => _seekRelative(const Duration(seconds: -10)),
-                    child: Container(
-                      width: 50, height: 50,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: Colors.black.withValues(alpha: 0.6),
-                      ),
-                      child: const Icon(Icons.replay_10, color: Colors.white, size: 28),
+            // Column: top / center / bottom — guaranteed no overlap
+            Column(
+              children: [
+                // ── TOP BAR
+                Container(
+                  decoration: const BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [Color(0xDD000000), Colors.transparent],
                     ),
                   ),
-                  const SizedBox(width: 24),
-                  TvFocusable(
-                    focusNode: _playPauseFocus,
-                    isCircle: true,
-                    scaleOnFocus: true,
-                    onActivate: _togglePlay,
-                    child: Container(
-                      width: 72, height: 72,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: AppColors.accent,
-                        boxShadow: [
-                          BoxShadow(
-                            color: AppColors.accent.withValues(alpha: 0.4),
-                            blurRadius: 16,
-                            spreadRadius: 2,
+                  child: SafeArea(
+                    bottom: false,
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(8, 6, 8, 20),
+                      child: Row(
+                        children: [
+                          _overlayBtn(
+                            icon: Icons.arrow_back,
+                            onTap: () {
+                              if (isFullscreen) {
+                                _toggleFullscreen();
+                              } else {
+                                _player?.pause();
+                                Navigator.of(context).pop();
+                              }
+                            },
+                          ),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(
+                                  item.title,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                if (item.genre != null || item.year != null)
+                                  Text(
+                                    '${item.year ?? ''} • ${item.genre ?? ''}'.trim(),
+                                    style: const TextStyle(
+                                        color: Colors.white70, fontSize: 11),
+                                  ),
+                              ],
+                            ),
+                          ),
+                          if (item.isSeries) ...[
+                            const SizedBox(width: 6),
+                            _overlayBtn(
+                              icon: Icons.skip_next,
+                              onTap: _playNextEpisode,
+                            ),
+                          ],
+                          const SizedBox(width: 6),
+                          _overlayBtn(
+                            icon: isFav ? Icons.favorite : Icons.favorite_border,
+                            color: isFav ? AppColors.accent : Colors.white,
+                            onTap: () {
+                              state.toggleFavorite(item);
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(state.isFavorite(item.id)
+                                      ? 'Added to My List'
+                                      : 'Removed from My List'),
+                                  duration: const Duration(seconds: 2),
+                                ),
+                              );
+                            },
                           ),
                         ],
                       ),
-                      child: Icon(
-                        _playing ? Icons.pause : Icons.play_arrow,
-                        color: Colors.white,
-                        size: 40,
-                      ),
                     ),
-                  ),
-                  const SizedBox(width: 24),
-                  TvFocusable(
-                    isCircle: true,
-                    scaleOnFocus: true,
-                    onActivate: () => _seekRelative(const Duration(seconds: 10)),
-                    child: Container(
-                      width: 50, height: 50,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: Colors.black.withValues(alpha: 0.6),
-                      ),
-                      child: const Icon(Icons.forward_10, color: Colors.white, size: 28),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-
-            Positioned(
-              bottom: 0, left: 0, right: 0,
-              child: Container(
-                padding: EdgeInsets.fromLTRB(16, 24, 16, isFullscreen ? 16 : 24),
-                decoration: const BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.bottomCenter,
-                    end: Alignment.topCenter,
-                    colors: [Color(0xDD000000), Colors.transparent],
                   ),
                 ),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
+
+                // ── CENTER CONTROLS (in remaining space above seek bar)
+                Expanded(
+                  child: Center(
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
                       children: [
-                        Text(
-                          _formatDuration(_position),
-                          style: const TextStyle(color: Colors.white, fontSize: 13),
-                        ),
-                        Expanded(
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 12),
-                            child: ClipRRect(
-                              borderRadius: BorderRadius.circular(4),
-                              child: LinearProgressIndicator(
-                                value: _duration.inMilliseconds > 0
-                                    ? (_position.inMilliseconds / _duration.inMilliseconds).clamp(0.0, 1.0)
-                                    : 0.0,
-                                backgroundColor: Colors.white24,
-                                valueColor: const AlwaysStoppedAnimation<Color>(AppColors.accent),
-                                minHeight: 4,
-                              ),
-                            ),
-                          ),
-                        ),
-                        Text(
-                          _duration.inMilliseconds > 0 ? _formatDuration(_duration) : 'LIVE',
-                          style: TextStyle(
-                            color: _duration.inMilliseconds > 0 ? Colors.white : AppColors.live,
-                            fontSize: 13,
-                            fontWeight: _duration.inMilliseconds > 0 ? FontWeight.normal : FontWeight.bold,
-                          ),
-                        ),
-                        const SizedBox(width: 14),
-                        TvFocusable(
-                          isCircle: true,
-                          scaleOnFocus: true,
-                          onActivate: _toggleFullscreen,
+                        // -10s
+                        GestureDetector(
+                          onTap: () {
+                            _seekRelative(const Duration(seconds: -10));
+                            _showControlsTemporarily();
+                          },
                           child: Container(
-                            width: 36, height: 36,
+                            width: 56, height: 56,
                             decoration: BoxDecoration(
                               shape: BoxShape.circle,
-                              color: Colors.black.withValues(alpha: 0.5),
-                              border: Border.all(color: Colors.white24, width: 1.5),
+                              color: Colors.white.withValues(alpha: 0.15),
+                              border: Border.all(color: Colors.white30, width: 1),
+                            ),
+                            child: const Icon(Icons.replay_10,
+                                color: Colors.white, size: 30),
+                          ),
+                        ),
+                        const SizedBox(width: 32),
+                        // Play/Pause
+                        GestureDetector(
+                          onTap: () {
+                            _togglePlay();
+                            _showControlsTemporarily();
+                          },
+                          child: Container(
+                            width: 72, height: 72,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: AppColors.accent,
+                              boxShadow: [
+                                BoxShadow(
+                                  color: AppColors.accent.withValues(alpha: 0.55),
+                                  blurRadius: 22,
+                                  spreadRadius: 3,
+                                ),
+                              ],
                             ),
                             child: Icon(
-                              isFullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
+                              _playing ? Icons.pause : Icons.play_arrow,
                               color: Colors.white,
-                              size: 18,
+                              size: 40,
                             ),
+                          ),
+                        ),
+                        const SizedBox(width: 32),
+                        // +10s
+                        GestureDetector(
+                          onTap: () {
+                            _seekRelative(const Duration(seconds: 10));
+                            _showControlsTemporarily();
+                          },
+                          child: Container(
+                            width: 56, height: 56,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Colors.white.withValues(alpha: 0.15),
+                              border: Border.all(color: Colors.white30, width: 1),
+                            ),
+                            child: const Icon(Icons.forward_10,
+                                color: Colors.white, size: 30),
                           ),
                         ),
                       ],
                     ),
-                    if (isFullscreen) ...[
-                      const SizedBox(height: 16),
-                      _overlaySuggestions(item),
-                    ],
-                  ],
+                  ),
                 ),
-              ),
+
+                // ── BOTTOM: seek bar + optional suggestions
+                Container(
+                  decoration: const BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.bottomCenter,
+                      end: Alignment.topCenter,
+                      colors: [Color(0xF0000000), Colors.transparent],
+                    ),
+                  ),
+                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 16),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // Seek bar row
+                      Row(
+                        children: [
+                          Text(
+                            _formatDuration(displayPos),
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 12,
+                              fontWeight: FontWeight.w500,
+                            ),
+                          ),
+                          Expanded(
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(horizontal: 10),
+                              child: LayoutBuilder(
+                                builder: (ctx, box) => GestureDetector(
+                                  behavior: HitTestBehavior.opaque,
+                                  onHorizontalDragStart: (_) {
+                                    setState(() => _draggingProgress = true);
+                                    _hideControlsTimer?.cancel();
+                                    _hideSuggestionsTimer?.cancel();
+                                  },
+                                  onHorizontalDragUpdate: (d) {
+                                    if (_duration.inMilliseconds <= 0) return;
+                                    final f = (d.localPosition.dx / box.maxWidth)
+                                        .clamp(0.0, 1.0);
+                                    setState(() => _dragPosition = Duration(
+                                        milliseconds:
+                                            (f * _duration.inMilliseconds).round()));
+                                  },
+                                  onHorizontalDragEnd: (_) {
+                                    _player?.seek(_dragPosition);
+                                    setState(() => _draggingProgress = false);
+                                    _showControlsTemporarily();
+                                  },
+                                  onTapDown: (d) {
+                                    if (_duration.inMilliseconds <= 0) return;
+                                    final f = (d.localPosition.dx / box.maxWidth)
+                                        .clamp(0.0, 1.0);
+                                    _player?.seek(Duration(
+                                        milliseconds:
+                                            (f * _duration.inMilliseconds).round()));
+                                    _showControlsTemporarily();
+                                  },
+                                  child: Container(
+                                    height: 32,
+                                    alignment: Alignment.center,
+                                    child: Stack(
+                                      alignment: Alignment.centerLeft,
+                                      children: [
+                                        // Track background
+                                        Container(
+                                          height: _draggingProgress ? 6 : 4,
+                                          width: double.infinity,
+                                          decoration: BoxDecoration(
+                                            color: Colors.white24,
+                                            borderRadius: BorderRadius.circular(4),
+                                          ),
+                                        ),
+                                        // Filled progress
+                                        FractionallySizedBox(
+                                          widthFactor: prog,
+                                          child: Container(
+                                            height: _draggingProgress ? 6 : 4,
+                                            decoration: BoxDecoration(
+                                              color: AppColors.accent,
+                                              borderRadius: BorderRadius.circular(4),
+                                            ),
+                                          ),
+                                        ),
+                                        // Thumb
+                                        if (prog > 0)
+                                          Align(
+                                            alignment: FractionalOffset(prog, 0.5),
+                                            child: Container(
+                                              width: _draggingProgress ? 18 : 14,
+                                              height: _draggingProgress ? 18 : 14,
+                                              decoration: BoxDecoration(
+                                                shape: BoxShape.circle,
+                                                color: Colors.white,
+                                                boxShadow: [
+                                                  BoxShadow(
+                                                    color: AppColors.accent,
+                                                    blurRadius: 6,
+                                                    spreadRadius: 1,
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                          ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                          Text(
+                            item.isLive && _duration.inMilliseconds == 0
+                                ? 'LIVE'
+                                : _formatDuration(_duration),
+                            style: TextStyle(
+                              color: item.isLive && _duration.inMilliseconds == 0
+                                  ? AppColors.live
+                                  : Colors.white,
+                              fontSize: 12,
+                              fontWeight:
+                                  item.isLive && _duration.inMilliseconds == 0
+                                      ? FontWeight.bold
+                                      : FontWeight.w500,
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          GestureDetector(
+                            onTap: _toggleFullscreen,
+                            child: Container(
+                              width: 36, height: 36,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: Colors.black.withValues(alpha: 0.55),
+                                border: Border.all(
+                                    color: Colors.white30, width: 1.5),
+                              ),
+                              child: Icon(
+                                isFullscreen
+                                    ? Icons.fullscreen_exit
+                                    : Icons.fullscreen,
+                                color: Colors.white,
+                                size: 18,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      // Suggestions (fullscreen only, auto-hide)
+                      if (isFullscreen)
+                        AnimatedOpacity(
+                          opacity: _showSuggestions ? 1.0 : 0.0,
+                          duration: const Duration(milliseconds: 400),
+                          child: IgnorePointer(
+                            ignoring: !_showSuggestions,
+                            child: Padding(
+                              padding: const EdgeInsets.only(top: 8),
+                              child: _overlaySuggestions(item),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ],
             ),
 
+            // Volume indicator (right side)
             Positioned(
               right: 24, top: 0, bottom: 0,
               child: IgnorePointer(
@@ -1503,7 +2157,9 @@ class _DetailScreenState extends State<DetailScreen> {
                                 child: LinearProgressIndicator(
                                   value: (_volume / 100.0).clamp(0.0, 1.0),
                                   backgroundColor: Colors.white24,
-                                  valueColor: const AlwaysStoppedAnimation<Color>(AppColors.accent),
+                                  valueColor:
+                                      const AlwaysStoppedAnimation<Color>(
+                                          AppColors.accent),
                                   minHeight: 8,
                                 ),
                               ),
@@ -1527,6 +2183,23 @@ class _DetailScreenState extends State<DetailScreen> {
       ),
     );
   }
+
+  Widget _overlayBtn({
+    required IconData icon,
+    required VoidCallback onTap,
+    Color color = Colors.white,
+  }) =>
+      GestureDetector(
+        onTap: onTap,
+        child: Container(
+          width: 40, height: 40,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: Colors.black.withValues(alpha: 0.55),
+          ),
+          child: Icon(icon, color: color, size: 22),
+        ),
+      );
 
   Widget _errorBanner(String msg, {VoidCallback? onRetry}) => Container(
         padding: const EdgeInsets.all(12),

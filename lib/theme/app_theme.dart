@@ -2,9 +2,9 @@ import 'package:flutter/material.dart';
 
 class AppColors {
   // Brand Colors
-  static const Color accent = Color(0xFFE8401C);
-  static const Color accentDark = Color(0xFFC0321A);
-  static const Color accentLight = Color(0xFFFF6B47);
+  static const Color accent = Color(0xFFDF0A24);
+  static const Color accentDark = Color(0xFFAC0018);
+  static const Color accentLight = Color(0xFFFF4D62);
 
   // Backgrounds
   static const Color bg = Color(0xFF06080F);
@@ -22,7 +22,7 @@ class AppColors {
   static const Color textTertiary = Color(0x66FFFFFF);
 
   // Status
-  static const Color live = Color(0xFFE8401C);
+  static const Color live = Color(0xFFDF0A24);
   static const Color success = Color(0xFF1DBD6A);
   static const Color gold = Color(0xFFF5A623);
 }
@@ -116,7 +116,7 @@ class AppTheme {
           ),
           focusedBorder: OutlineInputBorder(
             borderRadius: BorderRadius.circular(8),
-            borderSide: const BorderSide(color: AppColors.accent, width: 1.5),
+            borderSide: const BorderSide(color: AppColors.accent, width: 2.5),
           ),
           hintStyle: const TextStyle(
               color: AppColors.textTertiary, fontFamily: 'Inter'),

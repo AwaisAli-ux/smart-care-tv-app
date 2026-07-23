@@ -23,7 +23,7 @@
         android:usesCleartextTraffic="true"
         android:networkSecurityConfig="@xml/network_security_config"
         android:icon="@mipmap/ic_launcher"
-        android:banner="@mipmap/ic_launcher">
+        android:banner="@drawable/banner">
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -58,6 +58,15 @@
         <meta-data
             android:name="io.flutter.embedding.android.SplashScreenDrawable"
             android:resource="@drawable/launch_background" />
+        <!-- Impeller crashes/hangs on the GPU drivers found in most low/mid-range
+             Android TV boxes (Amlogic, Rockchip, MediaTek, Mali) when media_kit's
+             texture-based video surface is attached — this is the root cause of the
+             app closing/becoming unresponsive as soon as a channel, movie, or episode
+             starts playing. Falling back to Skia makes video rendering rock solid
+             across all the chipsets this app targets. -->
+        <meta-data
+            android:name="io.flutter.embedding.android.EnableImpeller"
+            android:value="false" />
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and
