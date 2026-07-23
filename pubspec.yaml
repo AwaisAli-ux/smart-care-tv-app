@@ -106,6 +106,7 @@ flutter:
   assets:
     - assets/images/               # App logo, placeholder posters, banners
     - assets/icons/                # Custom SVG icons (optional)
+    - assets/tv_keymaps.json       # TV remote keycode overrides (no recompile needed)
 
   # ── Fonts ──────────────────────────────────────────────────────────────────
   #

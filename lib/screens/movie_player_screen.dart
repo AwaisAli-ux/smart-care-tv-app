@@ -688,12 +688,26 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
 
   // ── Master key handler ───────────────────────────────────────────────────────
   KeyEventResult _onKey(FocusNode _, KeyEvent e) {
-    if (e is! KeyDownEvent && e is! KeyRepeatEvent) return KeyEventResult.ignored;
-    final k = e.logicalKey;
+    final action = TvRemoteNormalizer.normalize(e);
+    if (action == TvNavAction.none) return KeyEventResult.ignored;
 
-    // Volume keys — always handled
-    if (k == LogicalKeyboardKey.audioVolumeUp)   { _volumeUp();   return KeyEventResult.handled; }
-    if (k == LogicalKeyboardKey.audioVolumeDown) { _volumeDown(); return KeyEventResult.handled; }
+    // Volume
+    if (action == TvNavAction.volumeUp)   { _volumeUp();   return KeyEventResult.handled; }
+    if (action == TvNavAction.volumeDown) { _volumeDown(); return KeyEventResult.handled; }
+    if (action == TvNavAction.mute) {
+      _volume = _volume > 0 ? 0 : 80;
+      _player?.setVolume(_volume);
+      _showVolumeBarBriefly();
+      return KeyEventResult.handled;
+    }
+
+    // Media transport
+    if (action == TvNavAction.play  ||
+        action == TvNavAction.pause ||
+        action == TvNavAction.playPause) {
+      _togglePlay();
+      return KeyEventResult.handled;
+    }
 
     if (_showOverlay) _resetHideTimer();
 
@@ -741,8 +755,6 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
 
     // Any key while overlay hidden → show overlay
     if (!_showOverlay) {
-      final isSeekLeft = k == LogicalKeyboardKey.arrowLeft;
-      final isSeekRight = k == LogicalKeyboardKey.arrowRight;
       setState(() {
         _showOverlay = true;
         if (_controlsLocked) {
@@ -802,8 +814,8 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
       return KeyEventResult.handled;
     }
 
-    // ── Arrow navigation ─────────────────────────────────────────────────────
-    if (k == LogicalKeyboardKey.arrowLeft) {
+    // ── D-pad zone navigation ─────────────────────────────────────────────────
+    if (action == TvNavAction.left) {
       setState(() {
         switch (_zone) {
           case _MZone.lock:     _zone = _MZone.back; break;
@@ -826,7 +838,7 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
       return KeyEventResult.handled;
     }
 
-    if (k == LogicalKeyboardKey.arrowRight) {
+    if (action == TvNavAction.right) {
       setState(() {
         switch (_zone) {
           case _MZone.back:       _zone = _MZone.lock; break;
@@ -849,7 +861,7 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
       return KeyEventResult.handled;
     }
 
-    if (k == LogicalKeyboardKey.arrowUp) {
+    if (action == TvNavAction.up) {
       setState(() {
         switch (_zone) {
           case _MZone.replay:      _zone = _MZone.back; break;
@@ -867,7 +879,7 @@ class _MoviePlayerScreenState extends State<MoviePlayerScreen> {
       return KeyEventResult.handled;
     }
 
-    if (k == LogicalKeyboardKey.arrowDown) {
+    if (action == TvNavAction.down) {
       setState(() {
         switch (_zone) {
           case _MZone.back:        _zone = _MZone.replay; break;

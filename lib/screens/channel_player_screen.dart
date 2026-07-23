@@ -969,8 +969,8 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
 
   // ── Master key handler — single source of truth for ALL remote navigation ───
   KeyEventResult _onKey(FocusNode _, KeyEvent e) {
-    if (e is! KeyDownEvent && e is! KeyRepeatEvent) return KeyEventResult.ignored;
-    final k = e.logicalKey;
+    final action = TvRemoteNormalizer.normalize(e);
+    if (action == TvNavAction.none) return KeyEventResult.ignored;
 
     // Volume keys — always handled (covers ALL brands' remote volume buttons)
     if (k == LogicalKeyboardKey.audioVolumeUp)   { _volumeUp();   return KeyEventResult.handled; }
@@ -1069,8 +1069,8 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
       return KeyEventResult.handled;
     }
 
-    // ── Arrow navigation ──────────────────────────────────────────────────────
-    if (k == LogicalKeyboardKey.arrowLeft) {
+    // ── D-pad zone navigation ─────────────────────────────────────────────────
+    if (action == TvNavAction.left) {
       setState(() {
         switch (_zone) {
           case _Zone.lock:     _zone = _Zone.back; break;
@@ -1081,8 +1081,8 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
           case _Zone.forward:  _zone = _Zone.play; break;
           case _Zone.progress:
             if (_player != null) {
-              final target = _player!.state.position - const Duration(seconds: 10);
-              _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
+              final t = _player!.state.position - const Duration(seconds: 10);
+              _player!.seek(t < Duration.zero ? Duration.zero : (t > _duration ? _duration : t));
             }
             break;
           case _Zone.speed:       _zone = _Zone.aspectRatio; break;
@@ -1093,7 +1093,7 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
       return KeyEventResult.handled;
     }
 
-    if (k == LogicalKeyboardKey.arrowRight) {
+    if (action == TvNavAction.right) {
       setState(() {
         switch (_zone) {
           case _Zone.back:       _zone = _Zone.lock; break;
@@ -1104,8 +1104,8 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
           case _Zone.forward:    break;
           case _Zone.progress:
             if (_player != null) {
-              final target = _player!.state.position + const Duration(seconds: 10);
-              _player!.seek(target < Duration.zero ? Duration.zero : (target > _duration ? _duration : target));
+              final t = _player!.state.position + const Duration(seconds: 10);
+              _player!.seek(t < Duration.zero ? Duration.zero : (t > _duration ? _duration : t));
             }
             break;
           case _Zone.aspectRatio: _zone = _Zone.speed; break;
@@ -1116,7 +1116,7 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
       return KeyEventResult.handled;
     }
 
-    if (k == LogicalKeyboardKey.arrowUp) {
+    if (action == TvNavAction.up) {
       setState(() {
         switch (_zone) {
           case _Zone.replay:      _zone = _Zone.back; break;
@@ -1134,7 +1134,7 @@ class _ChannelPlayerScreenState extends State<ChannelPlayerScreen> {
       return KeyEventResult.handled;
     }
 
-    if (k == LogicalKeyboardKey.arrowDown) {
+    if (action == TvNavAction.down) {
       setState(() {
         switch (_zone) {
           case _Zone.back:        _zone = _Zone.replay; break;

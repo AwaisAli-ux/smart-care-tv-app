@@ -342,7 +342,8 @@ class _TvListItemState extends State<TvListItem> {
       widget.onActivate?.call();
       return KeyEventResult.handled;
     }
-    return KeyEventResult.ignored;
+    widget.onActivate?.call();
+    return KeyEventResult.handled;
   }
 
   @override

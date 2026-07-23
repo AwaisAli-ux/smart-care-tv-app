@@ -10,6 +10,7 @@ import 'services/device_lock_service.dart';
 import 'services/player_factory.dart';
 import 'services/search_state.dart';
 import 'screens/splash_screen.dart';
+import 'utils/tv_remote_normalizer.dart';
 
 /// App-wide navigator key — lets DeviceLockService replace the entire route
 import 'services/cache_service.dart';
